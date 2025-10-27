@@ -16,6 +16,7 @@ import { Chat } from './models/Chat.js';
 import { MT5Groups } from './models/MT5Groups.js';
 import { GroupCommissionStructures } from './models/GroupCommissionStructures.js';
 import { IBGroupAssignment } from './models/IBGroupAssignment.js';
+import { IBTradeHistory } from './models/IBTradeHistory.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -24,6 +25,7 @@ import ibRequestRoutes from './routes/ibRequest.js';
 import adminIBRequestRoutes from './routes/adminIBRequests.js';
 import adminSymbolsRoutes from './routes/adminSymbols.js';
 import chatRoutes from './routes/chat.js';
+import mt5TradesRoutes from './routes/mt5Trades.js';
 
 
 dotenv.config();
@@ -65,6 +67,7 @@ async function initializeDatabase() {
     await MT5Groups.createTable();
     await GroupCommissionStructures.createTable();
     await IBGroupAssignment.createTable();
+    await IBTradeHistory.createTable();
     await IBAdmin.seedDefaultAdmin();
     console.log('Database tables initialized successfully');
   } catch (error) {
@@ -79,6 +82,7 @@ app.use('/api/ib-requests', ibRequestRoutes);
 app.use('/api/admin/ib-requests', adminIBRequestRoutes);
 app.use('/api/admin/symbols', adminSymbolsRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/admin/mt5-trades', mt5TradesRoutes);
 
 
 // Health check endpoint
@@ -184,6 +188,74 @@ io.on('connection', (socket) => {
   });
 });
 
+// Background job to auto-sync trades every 15 minutes
+async function autoSyncTrades() {
+  try {
+    console.log('[Auto-Sync] Starting trade sync for all approved IB users...');
+    const { query } = await import('./config/database.js');
+
+    const result = await query("SELECT id, email, usd_per_lot, spread_percentage_per_lot FROM ib_requests WHERE LOWER(TRIM(status)) = 'approved'");
+    const ibUsers = result.rows;
+
+    for (const ib of ibUsers) {
+      try {
+        const userResult = await query('SELECT id FROM "User" WHERE email = $1', [ib.email]);
+        if (userResult.rows.length === 0) continue;
+
+        const userId = userResult.rows[0].id;
+
+        const assignmentsRes = await query(
+          'SELECT group_id, structure_name, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
+          [ib.id]
+        );
+        const commissionMap = assignmentsRes.rows.reduce((map, row) => {
+          if (!row.group_id) return map;
+          map[row.group_id.toLowerCase()] = {
+            usdPerLot: Number(row.usd_per_lot || 0),
+            spreadPercentage: Number(row.spread_share_percentage || 0)
+          };
+          return map;
+        }, {});
+
+        if (!Object.keys(commissionMap).length) {
+          commissionMap['*'] = {
+            usdPerLot: Number(ib.usd_per_lot || 0),
+            spreadPercentage: Number(ib.spread_percentage_per_lot || 0)
+          };
+        }
+
+        const accountsResult = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
+
+        for (const account of accountsResult.rows) {
+          const accountId = account.accountId;
+          const to = new Date().toISOString();
+          const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+          try {
+            const apiUrl = `http://18.130.5.209:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+            const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
+
+            if (response.ok) {
+              const data = await response.json();
+              const trades = data.Items || [];
+              await IBTradeHistory.saveTrades(trades, accountId, userId, ib.id);
+              await IBTradeHistory.calculateIBCommissions(accountId, ib.id);
+            }
+          } catch (error) {
+            console.error(`[Auto-Sync] Error syncing account ${accountId}:`, error.message);
+          }
+        }
+      } catch (error) {
+        console.error(`[Auto-Sync] Error processing IB ${ib.id}:`, error.message);
+      }
+    }
+
+    console.log('[Auto-Sync] Trade sync completed');
+  } catch (error) {
+    console.error('[Auto-Sync] Error in auto-sync job:', error);
+  }
+}
+
 // Bootstrapping to ensure DB is ready before accepting requests
 async function start() {
   try {
@@ -194,6 +266,13 @@ async function start() {
       console.log(`IB Portal Server is running on port ${PORT}`);
       console.log(`Socket.IO server is ready`);
       console.log(`Environment: ${process.env.NODE_ENV}`);
+      
+      // Start auto-sync job (every 15 minutes)
+      console.log('[Auto-Sync] Scheduling auto-sync job every 15 minutes');
+      setInterval(autoSyncTrades, 15 * 60 * 1000); // 15 minutes
+      
+      // Run initial sync after 1 minute
+      setTimeout(autoSyncTrades, 60 * 1000);
     });
   } catch (err) {
     console.error('Failed to initialize server:', err);

@@ -3,6 +3,7 @@
  import { MT5Groups } from '../models/MT5Groups.js';
 import { GroupCommissionStructures } from '../models/GroupCommissionStructures.js';
 import { IBGroupAssignment } from '../models/IBGroupAssignment.js';
+import { IBTradeHistory } from '../models/IBTradeHistory.js';
  import { authenticateAdminToken } from './adminAuth.js';
  import { query } from '../config/database.js';
 
@@ -621,6 +622,122 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
   }
 });
 
+// Account statistics (live MT5 balances)
+router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [id]);
+    if (ibResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'IB not found' });
+    }
+
+    const email = ibResult.rows[0].email;
+    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          totals: { totalAccounts: 0, totalBalance: 0, totalEquity: 0 },
+          accounts: []
+        }
+      });
+    }
+
+    const userId = userResult.rows[0].id;
+    const accountsResult = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
+
+    const totals = {
+      totalAccounts: accountsResult.rows.length,
+      totalBalance: 0,
+      totalEquity: 0
+    };
+
+    const accounts = [];
+
+    for (const row of accountsResult.rows) {
+      const accountId = row.accountId;
+      let payload = null;
+      try {
+        const balanceUrl = `http://18.130.5.209:5003/api/Users/${accountId}/getClientBalance`;
+        const response = await fetch(balanceUrl, { headers: { accept: '*/*' } });
+        if (response.ok) {
+          const data = await response.json();
+          if (data?.Success && data?.Data) {
+            payload = data.Data;
+          }
+        }
+      } catch (error) {
+        console.error(`Balance fetch failed for ${accountId}:`, error.message);
+      }
+
+      const balance = Number(payload?.Balance || 0);
+      const equity = Number(payload?.Equity || 0);
+
+      totals.totalBalance += balance;
+      totals.totalEquity += equity;
+
+      accounts.push({
+        accountId,
+        balance,
+        equity,
+        margin: Number(payload?.Margin || 0),
+        profit: Number(payload?.Profit || 0),
+        currencyDigits: payload?.CurrencyDigits || 2,
+        marginFree: Number(payload?.MarginFree || 0),
+        raw: payload
+      });
+    }
+
+    const tradeMetrics = await IBTradeHistory.getAccountStats(userId);
+    const summary = tradeMetrics.reduce((acc, row) => {
+      acc.totalTrades += Number(row.trade_count || 0);
+      acc.totalVolume += Number(row.total_volume || 0);
+      acc.totalProfit += Number(row.total_profit || 0);
+      acc.totalIbCommission += Number(row.total_ib_commission || 0);
+      return acc;
+    }, { totalTrades: 0, totalVolume: 0, totalProfit: 0, totalIbCommission: 0 });
+
+    res.json({ success: true, data: { totals, accounts, trades: tradeMetrics, tradeSummary: summary } });
+  } catch (error) {
+    console.error('Fetch account stats error:', error);
+    res.status(500).json({ success: false, message: 'Unable to fetch account statistics' });
+  }
+});
+
+// Trade history for IB profile
+router.get('/profiles/:id/trades', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { accountId, page = 1, pageSize = 50, sync } = req.query;
+
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [id]);
+    if (ibResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'IB not found' });
+    }
+
+    const email = ibResult.rows[0].email;
+    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.json({ success: true, data: { trades: [], total: 0, page: Number(page), pageSize: Number(pageSize) } });
+    }
+
+    const userId = userResult.rows[0].id;
+
+    if (sync === '1' && accountId) {
+      await syncTradesForAccount({ ibId: id, userId, accountId });
+    }
+
+    const limit = Math.min(Math.max(Number(pageSize) || 50, 1), 500);
+    const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
+
+    const result = await IBTradeHistory.getTrades({ userId, accountId, limit, offset });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('Fetch trade history error:', error);
+    res.status(500).json({ success: false, message: 'Unable to fetch trade history' });
+  }
+});
+
 async function getUserPhone(email) {
   try {
     const result = await query('SELECT * FROM "User" WHERE email = $1 LIMIT 1', [email]);
@@ -698,20 +815,290 @@ async function getGroupAssignments(record) {
   }
 }
 
-async function getAccountStats() {
-  return {
-    totalAccounts: 0,
-    totalBalance: 0,
-    totalEquity: 0
-  };
+async function buildCommissionMap(ibId) {
+  const assignments = await query(
+    'SELECT group_id, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
+    [ibId]
+  );
+
+  const map = assignments.rows.reduce((acc, row) => {
+    if (!row.group_id) return acc;
+    acc[row.group_id.toLowerCase()] = {
+      usdPerLot: Number(row.usd_per_lot || 0),
+      spreadPercentage: Number(row.spread_share_percentage || 0)
+    };
+    return acc;
+  }, {});
+
+  if (!Object.keys(map).length) {
+    const fallback = await query('SELECT usd_per_lot, spread_percentage_per_lot FROM ib_requests WHERE id = $1', [ibId]);
+    const row = fallback.rows[0];
+    map['*'] = {
+      usdPerLot: Number(row?.usd_per_lot || 0),
+      spreadPercentage: Number(row?.spread_percentage_per_lot || 0)
+    };
+  }
+
+  return map;
 }
 
-async function getTradingAccounts() {
-  return [];
+async function syncTradesForAccount({ ibId, userId, accountId }) {
+  try {
+    const commissionMap = await buildCommissionMap(ibId);
+    const to = new Date().toISOString();
+    const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const apiUrl = `http://18.130.5.209:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+
+    const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
+    if (!response.ok) {
+      return false;
+    }
+
+    const data = await response.json();
+    const trades = data.Items || [];
+    await IBTradeHistory.upsertTrades(trades, {
+      accountId,
+      ibRequestId: ibId,
+      userId,
+      commissionMap
+    });
+    return true;
+  } catch (error) {
+    console.error(`Trade sync failed for account ${accountId}:`, error.message);
+    return false;
+  }
 }
 
-async function getTradeHistory() {
-  return [];
+async function getAccountStats(ibId) {
+  try {
+    // First, get the email from the IB request
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+    if (ibResult.rows.length === 0) {
+      return { totalAccounts: 0, totalBalance: 0, totalEquity: 0 };
+    }
+    const email = ibResult.rows[0].email;
+
+    // Get the User UUID from the User table
+    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return { totalAccounts: 0, totalBalance: 0, totalEquity: 0 };
+    }
+    const userId = userResult.rows[0].id;
+
+    // Step 1: Get all MT5 accounts from database first
+    const result = await query(
+      'SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1',
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return {
+        totalAccounts: 0,
+        totalBalance: 0,
+        totalEquity: 0
+      };
+    }
+
+    console.log(`[Account Stats] Found ${result.rows.length} MT5 accounts for IB ${ibId}`);
+
+    // Step 2: Fetch all account data in parallel
+    const fetchPromises = result.rows.map(async (row) => {
+      const accountId = row.accountId;
+      
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+        
+        const response = await fetch(
+          `http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`,
+          {
+            headers: { 'accept': '*/*' },
+            signal: controller.signal
+          }
+        );
+        
+        clearTimeout(timeout);
+
+        if (response.ok) {
+          const apiData = await response.json();
+          if (apiData.Success && apiData.Data) {
+            return {
+              success: true,
+              balance: Number(apiData.Data.Balance || 0),
+              equity: Number(apiData.Data.Equity || 0)
+            };
+          }
+        }
+        return { success: false };
+      } catch (error) {
+        console.warn(`[Account Stats] Error fetching MT5 account ${accountId}:`, error.message);
+        return { success: false };
+      }
+    });
+
+    // Wait for all fetches to complete
+    const results = await Promise.all(fetchPromises);
+    
+    // Calculate totals
+    let totalBalance = 0;
+    let totalEquity = 0;
+    let successfulFetches = 0;
+
+    results.forEach(result => {
+      if (result.success) {
+        totalBalance += result.balance;
+        totalEquity += result.equity;
+        successfulFetches++;
+      }
+    });
+
+    console.log(`[Account Stats] Successfully fetched ${successfulFetches}/${result.rows.length} accounts`);
+
+    return {
+      totalAccounts: successfulFetches,
+      totalBalance: totalBalance,
+      totalEquity: totalEquity
+    };
+  } catch (error) {
+    console.error('Error in getAccountStats:', error);
+    return {
+      totalAccounts: 0,
+      totalBalance: 0,
+      totalEquity: 0
+    };
+  }
+}
+
+async function getTradingAccounts(ibId) {
+  try {
+    // First, get the email from the IB request
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+    if (ibResult.rows.length === 0) {
+      return [];
+    }
+    const email = ibResult.rows[0].email;
+
+    // Get the User UUID from the User table
+    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return [];
+    }
+    const userId = userResult.rows[0].id;
+
+    // Step 1: Get all MT5 accounts from database first
+    const result = await query(
+      'SELECT "accountId", leverage FROM "MT5Account" WHERE "userId" = $1',
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return [];
+    }
+
+    console.log(`[Trading Accounts] Found ${result.rows.length} MT5 accounts for IB ${ibId}`);
+
+    // Step 2: Return accounts from database FIRST (don't wait for API)
+    const tradingAccounts = result.rows.map(row => ({
+      mtsId: row.accountId,
+      balance: 0,
+      equity: 0,
+      group: 'Loading...',
+      leverage: row.leverage || 1000,
+      currency: 'USD',
+      status: 1
+    }));
+
+    // Step 3: Try to fetch live data (don't fail if it times out)
+    try {
+      const fetchPromises = result.rows.map(async (row, index) => {
+        const accountId = row.accountId;
+        
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+          
+          const response = await fetch(
+            `http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`,
+            {
+              headers: { 'accept': '*/*' },
+              signal: controller.signal
+            }
+          );
+          
+          clearTimeout(timeout);
+
+          if (response.ok) {
+            const apiData = await response.json();
+            if (apiData.Success && apiData.Data) {
+              const data = apiData.Data;
+              
+              // Extract friendly group name
+              let groupName = data.Group || 'Unknown';
+              if (groupName.includes('\\')) {
+                const parts = groupName.split('\\');
+                groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+              }
+
+              // Update the account with live data
+              tradingAccounts[index] = {
+                mtsId: data.Login || accountId,
+                balance: Number(data.Balance || 0),
+                equity: Number(data.Equity || 0),
+                group: groupName,
+                leverage: data.Leverage || row.leverage || 1000,
+                currency: 'USD',
+                status: data.IsEnabled ? 1 : 0
+              };
+            }
+          }
+        } catch (error) {
+          console.warn(`[Trading Accounts] API timeout for account ${accountId}, using database data`);
+        }
+      });
+
+      // Wait for API calls (max 10 seconds each)
+      await Promise.all(fetchPromises);
+    } catch (error) {
+      console.warn(`[Trading Accounts] Error fetching live data:`, error.message);
+    }
+
+    console.log(`[Trading Accounts] Returning ${tradingAccounts.length} accounts`);
+
+    return tradingAccounts;
+  } catch (error) {
+    console.error('Error in getTradingAccounts:', error);
+    return [];
+  }
+}
+
+async function getTradeHistory(ibId) {
+  try {
+    // Get recent trades from ib_trade_history
+    const tradesResult = await query(`
+      SELECT * FROM ib_trade_history
+      WHERE ib_request_id = $1
+      ORDER BY synced_at DESC
+      LIMIT 100
+    `, [ibId]);
+
+    return tradesResult.rows.map(trade => ({
+      id: trade.id,
+      dealId: trade.order_id,
+      accountId: trade.account_id,
+      symbol: trade.symbol,
+      action: trade.order_type,
+      volumeLots: Number(trade.volume_lots || 0),
+      openPrice: Number(trade.open_price || 0),
+      closePrice: Number(trade.close_price || 0),
+      profit: Number(trade.profit || 0),
+      ibCommission: Number(trade.ib_commission || 0),
+      takeProfit: Number(trade.take_profit || 0),
+      stopLoss: Number(trade.stop_loss || 0)
+    }));
+  } catch (error) {
+    console.error('Error in getTradeHistory:', error);
+    return [];
+  }
 }
 
 async function getTreeStructure() {

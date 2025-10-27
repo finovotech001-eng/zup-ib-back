@@ -59,7 +59,7 @@ export class Chat {
         )
       `);
 
-      console.log('Chat tables created or already exist');
+      // Tables ensured
     } catch (error) {
       console.error('Error creating chat tables:', error);
       throw error;

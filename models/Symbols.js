@@ -24,7 +24,6 @@ export class Symbols {
           UNIQUE(symbol_name)
         )
       `);
-      console.log('Symbols table created or already exists');
     } catch (error) {
       console.error('Error creating symbols table:', error);
       throw error;
