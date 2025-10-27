@@ -1,7 +1,8 @@
  import express from 'express';
  import { IBRequest, IB_REQUEST_TYPE_VALUES, IB_REQUEST_STATUS_VALUES } from '../models/IBRequest.js';
  import { MT5Groups } from '../models/MT5Groups.js';
- import { GroupCommissionStructures } from '../models/GroupCommissionStructures.js';
+import { GroupCommissionStructures } from '../models/GroupCommissionStructures.js';
+import { IBGroupAssignment } from '../models/IBGroupAssignment.js';
  import { authenticateAdminToken } from './adminAuth.js';
  import { query } from '../config/database.js';
 
@@ -323,8 +324,14 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
           });
         }
 
-        // TODO: Store additional groups data in a separate table for multiple group assignments
-        // For now, we'll just use the first group for the main record
+        await IBGroupAssignment.replaceAssignments(id, groups.map((group) => ({
+          groupId: group.groupId,
+          groupName: group.groupName,
+          structureId: group.structureId,
+          structureName: group.structureName,
+          usdPerLot: group.usdPerLot,
+          spreadSharePercentage: group.spreadSharePercentage
+        })));
 
         res.json({
           success: true,
@@ -385,6 +392,15 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
           });
         }
 
+        await IBGroupAssignment.replaceAssignments(id, [{
+          groupId,
+          groupName: null,
+          structureId,
+          structureName: null,
+          usdPerLot: parsedUsdPerLot,
+          spreadSharePercentage: parsedSpreadPercentage
+        }]);
+
         res.json({
           success: true,
           message: `IB request ${status} successfully`,
@@ -412,6 +428,8 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
             message: 'IB request not found'
           });
         }
+
+        await IBGroupAssignment.clearAssignments(id);
 
         res.json({
           success: true,
@@ -517,13 +535,13 @@ router.get('/profiles/approved', authenticateAdminToken, async (req, res) => {
       ibType: record.ib_type,
       joinDate: record.join_date,
       approvedDate: record.approved_at,
-      usdPerLot: record.usd_per_lot,
-      spreadPercentagePerLot: record.spread_percentage_per_lot,
+      usdPerLot: Number(record.usd_per_lot || 0),
+      spreadPercentagePerLot: Number(record.spread_percentage_per_lot || 0),
       adminComments: record.admin_comments,
       totalClients: 0,
       totalVolume: 0,
-      commission: record.usd_per_lot || 0,
-      performance: 'new'
+      commission: Number(record.usd_per_lot || 0),
+      performance: null
     }));
 
     res.json({ success: true, data: { profiles } });
@@ -550,7 +568,9 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
           approved_at,
           usd_per_lot,
           spread_percentage_per_lot,
-          admin_comments
+          admin_comments,
+          group_id,
+          structure_id
         FROM ib_requests
         WHERE id = $1 AND LOWER(TRIM(status)) = 'approved'
       `,
@@ -565,37 +585,25 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
     }
 
     const record = result.rows[0];
-
-    // Real group/structure enrichment if available on request
-    let groups = [];
-    if (record.group_id) {
-      const groupRes = await query('SELECT group_id, name FROM mt5_groups WHERE group_id = $1', [record.group_id]);
-      const structureRes = record.structure_id
-        ? await query('SELECT id, structure_name, usd_per_lot, spread_share_percentage FROM group_commission_structures WHERE id = $1', [record.structure_id])
-        : { rows: [] };
-      const group = groupRes.rows[0];
-      const structure = structureRes.rows[0];
-      if (group) {
-        groups.push({
-          groupId: group.group_id,
-          groupName: group.name || group.group_id,
-          structureId: structure?.id || null,
-          structureName: structure?.structure_name || null,
-          usdPerLot: Number(record.usd_per_lot || structure?.usd_per_lot || 0),
-          spreadSharePercentage: Number(record.spread_percentage_per_lot || structure?.spread_share_percentage || 0)
-        });
-      }
-    }
+    const phone = await getUserPhone(record.email);
+    const groups = await getGroupAssignments(record);
 
     const profile = {
       id: record.id,
+      status: record.status,
       fullName: record.full_name,
       email: record.email,
+      phone,
       ibType: record.ib_type,
-      usdPerLot: record.usd_per_lot || 0,
-      spreadPercentagePerLot: record.spread_percentage_per_lot || 0,
+      usdPerLot: Number(record.usd_per_lot || 0),
+      spreadPercentagePerLot: Number(record.spread_percentage_per_lot || 0),
       approvedDate: record.approved_at,
-      groups
+      adminComments: record.admin_comments,
+      groups,
+      accountStats: await getAccountStats(record.id),
+      tradingAccounts: await getTradingAccounts(record.id),
+      tradeHistory: await getTradeHistory(record.id),
+      treeStructure: await getTreeStructure(record.id)
     };
 
     res.json({
@@ -613,7 +621,108 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
   }
 });
 
-// Helper function to get IB groups and commission data
+async function getUserPhone(email) {
+  try {
+    const result = await query('SELECT * FROM "User" WHERE email = $1 LIMIT 1', [email]);
+    if (!result.rows.length) {
+      return null;
+    }
+    const user = result.rows[0];
+    return (
+      user.phone ||
+      user.phone_number ||
+      user.phonenumber ||
+      user.mobile ||
+      user.mobile_number ||
+      user.contact_number ||
+      null
+    );
+  } catch (error) {
+    console.warn('Fetch user phone error:', error.message);
+    return null;
+  }
+}
+
+async function getGroupAssignments(record) {
+  try {
+    const savedAssignments = await IBGroupAssignment.getByIbRequestId(record.id);
+    if (savedAssignments.length) {
+      return savedAssignments.map((assignment) => ({
+        groupId: assignment.group_id,
+        groupName: assignment.group_name || assignment.group_id,
+        structureId: assignment.structure_id,
+        structureName: assignment.structure_name,
+        usdPerLot: Number(assignment.usd_per_lot || 0),
+        spreadSharePercentage: Number(assignment.spread_share_percentage || 0),
+        totalCommission: 0,
+        totalLots: 0,
+        totalVolume: 0
+      }));
+    }
+
+    if (!record.group_id) {
+      return [];
+    }
+
+    const groupRes = await query('SELECT group_id, name FROM mt5_groups WHERE group_id = $1', [record.group_id]);
+    const structureRes = record.structure_id
+      ? await query(
+          'SELECT id, structure_name, usd_per_lot, spread_share_percentage FROM group_commission_structures WHERE id = $1',
+          [record.structure_id]
+        )
+      : { rows: [] };
+
+    const group = groupRes.rows[0];
+    if (!group) {
+      return [];
+    }
+
+    const structure = structureRes.rows[0];
+
+    return [
+      {
+        groupId: group.group_id,
+        groupName: group.name || group.group_id,
+        structureId: structure?.id || null,
+        structureName: structure?.structure_name || null,
+        usdPerLot: Number(record.usd_per_lot || structure?.usd_per_lot || 0),
+        spreadSharePercentage: Number(record.spread_percentage_per_lot || structure?.spread_share_percentage || 0),
+        totalCommission: 0,
+        totalLots: 0,
+        totalVolume: 0
+      }
+    ];
+  } catch (error) {
+    console.error('Error fetching group assignments:', error);
+    return [];
+  }
+}
+
+async function getAccountStats() {
+  return {
+    totalAccounts: 0,
+    totalBalance: 0,
+    totalEquity: 0
+  };
+}
+
+async function getTradingAccounts() {
+  return [];
+}
+
+async function getTradeHistory() {
+  return [];
+}
+
+async function getTreeStructure() {
+  return {
+    ownLots: 0,
+    teamLots: 0,
+    totalTrades: 0
+  };
+}
+
+// Helper function to get IB groups and commission data (legacy mock)
 async function getIBGroupsData(ibId) {
   try {
     // For now, return mock data - in real implementation, this would query actual group assignments

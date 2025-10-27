@@ -15,6 +15,7 @@ import { Symbols } from './models/Symbols.js';
 import { Chat } from './models/Chat.js';
 import { MT5Groups } from './models/MT5Groups.js';
 import { GroupCommissionStructures } from './models/GroupCommissionStructures.js';
+import { IBGroupAssignment } from './models/IBGroupAssignment.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -63,6 +64,7 @@ async function initializeDatabase() {
     await Chat.createTables();
     await MT5Groups.createTable();
     await GroupCommissionStructures.createTable();
+    await IBGroupAssignment.createTable();
     await IBAdmin.seedDefaultAdmin();
     console.log('Database tables initialized successfully');
   } catch (error) {
