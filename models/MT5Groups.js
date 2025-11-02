@@ -79,7 +79,7 @@ export class MT5Groups {
     await query(queryText);
   }
 
-  static async syncFromAPI(apiUrl = 'http://18.130.5.209:5003/api/Groups') {
+  static async syncFromAPI(apiUrl = 'http://18.175.242.21:5003/api/Groups') {
     try {
       const response = await axios.get(apiUrl, {
         headers: {

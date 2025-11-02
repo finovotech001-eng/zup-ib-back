@@ -14,10 +14,9 @@ export class IBTradeHistory {
       
       const checkResult = await query(checkTableQuery);
       const tableExists = checkResult.rows[0].exists;
-      
+      // Do not return early; we still need to run migrations/indexes when table exists
       if (tableExists) {
-        console.log('ib_trade_history table already exists');
-        return;
+        console.log('ib_trade_history table already exists; ensuring schema');
       }
       
       // Create table
@@ -45,11 +44,25 @@ export class IBTradeHistory {
       
       await query(createTableQuery);
       
+      // Ensure new columns exist
+      await query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ib_trade_history' AND column_name = 'group_id'
+          ) THEN
+            ALTER TABLE ib_trade_history ADD COLUMN group_id TEXT;
+          END IF;
+        END $$;
+      `);
+      
       // Create indexes separately
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_account ON ib_trade_history (account_id);');
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_user ON ib_trade_history (user_id);');
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_ib ON ib_trade_history (ib_request_id);');
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_symbol ON ib_trade_history (symbol);');
+      await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_group ON ib_trade_history (group_id);');
       
       console.log('✅ ib_trade_history table created successfully');
     } catch (error) {
@@ -58,7 +71,7 @@ export class IBTradeHistory {
   }
 
   // Upsert trades with optional IB commission calculation
-  static async upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap = {} }) {
+  static async upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap = {}, groupId = null }) {
     const saved = [];
     const usdPerLot = Number(commissionMap['*']?.usdPerLot || 0);
 
@@ -70,16 +83,16 @@ export class IBTradeHistory {
         if (!trade?.Symbol) continue;
 
         const id = `${accountId}-${orderId}`;
-        const volumeLots = Number(trade?.Volume || 0);
+        const volumeLots = Number(trade?.Volume || 0) * 1000;
         const ibCommission = volumeLots * usdPerLot;
 
         const queryText = `
           INSERT INTO ib_trade_history (
             id, order_id, account_id, user_id, ib_request_id, symbol, order_type,
             volume_lots, open_price, close_price, profit, take_profit, stop_loss,
-            ib_commission, synced_at
+            ib_commission, group_id, synced_at
           ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CURRENT_TIMESTAMP
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,CURRENT_TIMESTAMP
           )
           ON CONFLICT (order_id)
           DO UPDATE SET
@@ -87,6 +100,7 @@ export class IBTradeHistory {
             close_price = EXCLUDED.close_price,
             profit = EXCLUDED.profit,
             ib_commission = EXCLUDED.ib_commission,
+            group_id = COALESCE(EXCLUDED.group_id, ib_trade_history.group_id),
             updated_at = CURRENT_TIMESTAMP,
             synced_at = CURRENT_TIMESTAMP
           RETURNING *;
@@ -106,7 +120,8 @@ export class IBTradeHistory {
           Number(trade.Profit || 0),
           Number(trade.TakeProfit || 0),
           Number(trade.StopLoss || 0),
-          Number(ibCommission || 0)
+          Number(ibCommission || 0),
+          groupId
         ]);
 
         saved.push(result.rows[0]);
@@ -119,12 +134,16 @@ export class IBTradeHistory {
   }
 
   // Paginated trades for a user/account used by admin route
-  static async getTrades({ userId, accountId = null, limit = 50, offset = 0 }) {
+  static async getTrades({ userId, accountId = null, groupId = null, limit = 50, offset = 0 }) {
     const params = [userId];
     let where = 'user_id = $1';
     if (accountId) {
       params.push(String(accountId));
       where += ` AND account_id = $${params.length}`;
+    }
+    if (groupId) {
+      params.push(String(groupId));
+      where += ` AND group_id = $${params.length}`;
     }
 
     const countQuery = `SELECT COUNT(*)::int AS count FROM ib_trade_history WHERE ${where}`;
@@ -148,6 +167,7 @@ export class IBTradeHistory {
       profit: Number(row.profit || 0),
       commission: 0,
       ib_commission: Number(row.ib_commission || 0),
+      group_id: row.group_id || null,
       close_time: row.updated_at || row.synced_at || null
     }));
 
@@ -219,7 +239,7 @@ export class IBTradeHistory {
           ibRequestId,
           trade.Symbol || '',
           trade.OrderType || 'buy',
-          Number(trade.Volume || 0),
+          Number(trade.Volume || 0) * 1000,
           Number(trade.OpenPrice || 0),
           Number(trade.ClosePrice || 0),
           Number(trade.Profit || 0),

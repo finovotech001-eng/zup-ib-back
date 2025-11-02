@@ -652,40 +652,60 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       totalEquity: 0
     };
 
-    const accounts = [];
-
-    for (const row of accountsResult.rows) {
-      const accountId = row.accountId;
+    // Fetch profiles in parallel for speed, each with timeout + one retry
+    const fetchOne = async (accountId) => {
       let payload = null;
-      try {
-        const balanceUrl = `http://18.130.5.209:5003/api/Users/${accountId}/getClientBalance`;
-        const response = await fetch(balanceUrl, { headers: { accept: '*/*' } });
-        if (response.ok) {
-          const data = await response.json();
-          if (data?.Success && data?.Data) {
-            payload = data.Data;
+      const profileUrl = `http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`;
+      const attempt = async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000);
+        try {
+          const res = await fetch(profileUrl, { headers: { accept: '*/*' }, signal: controller.signal });
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.Success && (data?.Data || data?.data)) payload = data.Data || data.data;
           }
+        } catch {}
+        clearTimeout(timer);
+      };
+      await attempt();
+      if (!payload) await attempt();
+
+      const balance = Number(payload?.Balance ?? payload?.balance ?? 0);
+      const equity = Number(payload?.Equity ?? payload?.equity ?? 0);
+      let groupName = payload?.Group ?? payload?.group ?? payload?.GroupName ?? payload?.group_name ?? 'Unknown';
+      if (typeof groupName === 'string') {
+        // Prefer extracting the segment after 'Bbook\'
+        const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
+        if (match && match[1]) {
+          groupName = match[1];
+        } else if (groupName.includes('\\')) {
+          const parts = groupName.split('\\');
+          groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+        } else if (groupName.includes('/')) {
+          const parts = groupName.split('/');
+          groupName = parts[parts.length - 1];
         }
-      } catch (error) {
-        console.error(`Balance fetch failed for ${accountId}:`, error.message);
       }
 
-      const balance = Number(payload?.Balance || 0);
-      const equity = Number(payload?.Equity || 0);
-
-      totals.totalBalance += balance;
-      totals.totalEquity += equity;
-
-      accounts.push({
+      return {
         accountId,
         balance,
         equity,
-        margin: Number(payload?.Margin || 0),
-        profit: Number(payload?.Profit || 0),
-        currencyDigits: payload?.CurrencyDigits || 2,
-        marginFree: Number(payload?.MarginFree || 0),
+        margin: Number(payload?.Margin ?? payload?.margin ?? 0),
+        profit: Number(payload?.Profit ?? payload?.profit ?? 0),
+        currencyDigits: payload?.CurrencyDigits ?? payload?.currencyDigits ?? 2,
+        marginFree: Number(payload?.MarginFree ?? payload?.marginFree ?? 0),
+        group: groupName,
+        groupId: payload?.Group || payload?.group || null,
         raw: payload
-      });
+      };
+    };
+
+    const accounts = await Promise.all(accountsResult.rows.map(r => fetchOne(r.accountId)));
+    for (const acc of accounts) {
+      totals.totalBalance += acc.balance;
+      totals.totalEquity += acc.equity;
     }
 
     const tradeMetrics = await IBTradeHistory.getAccountStats(userId);
@@ -730,7 +750,8 @@ router.get('/profiles/:id/trades', authenticateAdminToken, async (req, res) => {
     const limit = Math.min(Math.max(Number(pageSize) || 50, 1), 500);
     const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
-    const result = await IBTradeHistory.getTrades({ userId, accountId, limit, offset });
+    const { groupId } = req.query;
+    const result = await IBTradeHistory.getTrades({ userId, accountId, groupId, limit, offset });
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Fetch trade history error:', error);
@@ -764,7 +785,7 @@ async function getGroupAssignments(record) {
   try {
     const savedAssignments = await IBGroupAssignment.getByIbRequestId(record.id);
     if (savedAssignments.length) {
-      return savedAssignments.map((assignment) => ({
+      const groups = savedAssignments.map((assignment) => ({
         groupId: assignment.group_id,
         groupName: assignment.group_name || assignment.group_id,
         structureId: assignment.structure_id,
@@ -774,6 +795,14 @@ async function getGroupAssignments(record) {
         totalCommission: 0,
         totalLots: 0,
         totalVolume: 0
+      }));
+      // Enrich with live totals from ib_trade_history aggregated by current account groups
+      const aggregates = await computeGroupAggregates(record.id, record.email);
+      return groups.map(g => ({
+        ...g,
+        totalCommission: Number(aggregates[g.groupId]?.totalCommission || 0),
+        totalLots: Number(aggregates[g.groupId]?.totalLots || 0),
+        totalVolume: Number(aggregates[g.groupId]?.totalLots || 0)
       }));
     }
 
@@ -796,7 +825,7 @@ async function getGroupAssignments(record) {
 
     const structure = structureRes.rows[0];
 
-    return [
+    const groups = [
       {
         groupId: group.group_id,
         groupName: group.name || group.group_id,
@@ -809,9 +838,69 @@ async function getGroupAssignments(record) {
         totalVolume: 0
       }
     ];
+    const aggregates = await computeGroupAggregates(record.id, record.email);
+    return groups.map(g => ({
+      ...g,
+      totalCommission: Number(aggregates[g.groupId]?.totalCommission || 0),
+      totalLots: Number(aggregates[g.groupId]?.totalLots || 0),
+      totalVolume: Number(aggregates[g.groupId]?.totalLots || 0)
+    }));
   } catch (error) {
     console.error('Error fetching group assignments:', error);
     return [];
+  }
+}
+
+// Build aggregates per MT5 group based on current account groups and ib_trade_history
+async function computeGroupAggregates(ibId, ibEmail) {
+  try {
+    // Resolve userId from email
+    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [ibEmail]);
+    if (!userResult.rows.length) return {};
+    const userId = userResult.rows[0].id;
+
+    // Fetch all accounts
+    const accountsRes = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
+    if (!accountsRes.rows.length) return {};
+
+    // Build map accountId -> groupId (full path) via ClientProfile (parallel for speed)
+    const accountToGroup = {};
+    const profilePromises = accountsRes.rows.map(async (row) => {
+      const accountId = row.accountId;
+      try {
+        const res = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+        if (res.ok) {
+          const data = await res.json();
+          const payload = data?.Data || data?.data || null;
+          const groupId = payload?.Group || payload?.group || null;
+          if (groupId) accountToGroup[String(accountId)] = groupId;
+        }
+      } catch {}
+    });
+    await Promise.allSettled(profilePromises);
+
+    if (!Object.keys(accountToGroup).length) return {};
+
+    // Sum lots and commissions per account from DB, then fold by groupId
+    const tradesRes = await query(
+      `SELECT account_id, COALESCE(SUM(volume_lots),0) AS total_lots, COALESCE(SUM(ib_commission),0) AS total_commission
+       FROM ib_trade_history WHERE ib_request_id = $1 GROUP BY account_id`,
+      [ibId]
+    );
+
+    const totals = tradesRes.rows.reduce((acc, row) => {
+      const groupId = accountToGroup[row.account_id];
+      if (!groupId) return acc; // skip if no mapping
+      if (!acc[groupId]) acc[groupId] = { totalLots: 0, totalCommission: 0 };
+      acc[groupId].totalLots += Number(row.total_lots || 0);
+      acc[groupId].totalCommission += Number(row.total_commission || 0);
+      return acc;
+    }, {});
+
+    return totals;
+  } catch (e) {
+    console.warn('computeGroupAggregates error:', e.message);
+    return {};
   }
 }
 
@@ -846,8 +935,9 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
   try {
     const commissionMap = await buildCommissionMap(ibId);
     const to = new Date().toISOString();
-    const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const apiUrl = `http://18.130.5.209:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+    // Fetch a wider window to ensure we capture existing trades
+    const from = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const apiUrl = `http://18.175.242.21:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
 
     const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
     if (!response.ok) {
@@ -856,11 +946,23 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
 
     const data = await response.json();
     const trades = data.Items || [];
+
+    // Resolve group id for this account
+    let groupId = null;
+    try {
+      const profRes = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+      if (profRes.ok) {
+        const prof = await profRes.json();
+        groupId = (prof?.Data || prof?.data)?.Group || null;
+      }
+    } catch {}
+
     await IBTradeHistory.upsertTrades(trades, {
       accountId,
       ibRequestId: ibId,
       userId,
-      commissionMap
+      commissionMap,
+      groupId
     });
     return true;
   } catch (error) {
@@ -910,7 +1012,7 @@ async function getAccountStats(ibId) {
         const timeout = setTimeout(() => controller.abort(), 15000); // 15 second timeout
         
         const response = await fetch(
-          `http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`,
+          `http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`,
           {
             headers: { 'accept': '*/*' },
             signal: controller.signal
@@ -1000,6 +1102,7 @@ async function getTradingAccounts(ibId) {
     // Step 2: Return accounts from database FIRST (don't wait for API)
     const tradingAccounts = result.rows.map(row => ({
       mtsId: row.accountId,
+      accountId: row.accountId,
       balance: 0,
       equity: 0,
       group: 'Loading...',
@@ -1008,59 +1111,43 @@ async function getTradingAccounts(ibId) {
       status: 1
     }));
 
-    // Step 3: Try to fetch live data (don't fail if it times out)
-    try {
-      const fetchPromises = result.rows.map(async (row, index) => {
-        const accountId = row.accountId;
-        
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-          
-          const response = await fetch(
-            `http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`,
-            {
-              headers: { 'accept': '*/*' },
-              signal: controller.signal
-            }
-          );
-          
-          clearTimeout(timeout);
-
-          if (response.ok) {
-            const apiData = await response.json();
-            if (apiData.Success && apiData.Data) {
-              const data = apiData.Data;
-              
-              // Extract friendly group name
-              let groupName = data.Group || 'Unknown';
-              if (groupName.includes('\\')) {
-                const parts = groupName.split('\\');
-                groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+    // Step 3: Optionally kick off background refresh but do not block response
+    // This keeps the endpoint fast; the client will call account-stats for live values.
+    (async () => {
+      try {
+        const fetchPromises = result.rows.map(async (row, index) => {
+          const accountId = row.accountId;
+          try {
+            const response = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { 'accept': '*/*' } });
+            if (response.ok) {
+              const apiData = await response.json();
+              if (apiData.Success && apiData.Data) {
+                const data = apiData.Data;
+                let groupName = data.Group || 'Unknown';
+                const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
+                if (match && match[1]) {
+                  groupName = match[1];
+                } else if (groupName.includes('\\')) {
+                  const parts = groupName.split('\\');
+                  groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+                }
+                tradingAccounts[index] = {
+                  mtsId: data.Login || accountId,
+                  accountId: data.Login || accountId,
+                  balance: Number(data.Balance || 0),
+                  equity: Number(data.Equity || 0),
+                  group: groupName,
+                  leverage: data.Leverage || row.leverage || 1000,
+                  currency: 'USD',
+                  status: data.IsEnabled ? 1 : 0
+                };
               }
-
-              // Update the account with live data
-              tradingAccounts[index] = {
-                mtsId: data.Login || accountId,
-                balance: Number(data.Balance || 0),
-                equity: Number(data.Equity || 0),
-                group: groupName,
-                leverage: data.Leverage || row.leverage || 1000,
-                currency: 'USD',
-                status: data.IsEnabled ? 1 : 0
-              };
             }
-          }
-        } catch (error) {
-          console.warn(`[Trading Accounts] API timeout for account ${accountId}, using database data`);
-        }
-      });
-
-      // Wait for API calls (max 10 seconds each)
-      await Promise.all(fetchPromises);
-    } catch (error) {
-      console.warn(`[Trading Accounts] Error fetching live data:`, error.message);
-    }
+          } catch {}
+        });
+        await Promise.allSettled(fetchPromises);
+      } catch {}
+    })();
 
     console.log(`[Trading Accounts] Returning ${tradingAccounts.length} accounts`);
 

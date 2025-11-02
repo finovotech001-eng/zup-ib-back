@@ -4,7 +4,7 @@ import { query } from '../config/database.js';
 import { authenticateAdminToken } from './adminAuth.js';
 
 const router = express.Router();
-const MT5_API_BASE = 'http://18.130.5.209:5003';
+const MT5_API_BASE = 'http://18.175.242.21:5003';
 
 // Sync trades from MT5 API for a specific account
 router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
@@ -46,8 +46,18 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
     const data = await response.json();
     const trades = data.Items || [];
     
+    // Resolve group id for this account
+    let groupId = null;
+    try {
+      const profRes = await fetch(`${MT5_API_BASE}/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+      if (profRes.ok) {
+        const prof = await profRes.json();
+        groupId = (prof?.Data || prof?.data)?.Group || null;
+      }
+    } catch {}
+
     // Save trades to database
-    const savedTrades = await IBTradeHistory.saveTrades(trades, accountId, userId, ibRequestId);
+    const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, groupId });
     
     // Calculate IB commissions
     await IBTradeHistory.calculateIBCommissions(accountId, ibRequestId);
@@ -116,7 +126,16 @@ router.post('/sync-user/:ibRequestId', authenticateAdminToken, async (req, res) 
         if (response.ok) {
           const data = await response.json();
           const trades = data.Items || [];
-          const savedTrades = await IBTradeHistory.saveTrades(trades, accountId, userId, ibRequestId);
+          // get group id per account
+          let groupId = null;
+          try {
+            const profRes = await fetch(`${MT5_API_BASE}/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+            if (profRes.ok) {
+              const prof = await profRes.json();
+              groupId = (prof?.Data || prof?.data)?.Group || null;
+            }
+          } catch {}
+          const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, groupId });
           
           // Calculate IB commissions
           await IBTradeHistory.calculateIBCommissions(accountId, ibRequestId);
@@ -249,4 +268,3 @@ router.get('/stats/:ibRequestId', authenticateAdminToken, async (req, res) => {
 });
 
 export default router;
-

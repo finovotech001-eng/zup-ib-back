@@ -32,7 +32,7 @@ export class Symbols {
 
   static async syncFromAPI() {
     try {
-      const response = await fetch('http://18.130.5.209:5003/api/Symbols', {
+      const response = await fetch('http://18.175.242.21:5003/api/Symbols', {
         method: 'GET',
         headers: {
           'accept': 'text/plain',

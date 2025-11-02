@@ -24,6 +24,7 @@ import adminAuthRoutes from './routes/adminAuth.js';
 import ibRequestRoutes from './routes/ibRequest.js';
 import adminIBRequestRoutes from './routes/adminIBRequests.js';
 import adminSymbolsRoutes from './routes/adminSymbols.js';
+import adminSymbolsWithCategoriesRoutes from './routes/adminSymbolsWithCategories.js';
 import chatRoutes from './routes/chat.js';
 import mt5TradesRoutes from './routes/mt5Trades.js';
 
@@ -81,6 +82,7 @@ app.use('/api/admin', adminAuthRoutes);
 app.use('/api/ib-requests', ibRequestRoutes);
 app.use('/api/admin/ib-requests', adminIBRequestRoutes);
 app.use('/api/admin/symbols', adminSymbolsRoutes);
+app.use('/api/admin/symbols-with-categories', adminSymbolsWithCategoriesRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/admin/mt5-trades', mt5TradesRoutes);
 
@@ -232,13 +234,22 @@ async function autoSyncTrades() {
           const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
           try {
-            const apiUrl = `http://18.130.5.209:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+            const apiUrl = `http://18.175.242.21:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
             const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
 
             if (response.ok) {
               const data = await response.json();
               const trades = data.Items || [];
-              await IBTradeHistory.saveTrades(trades, accountId, userId, ib.id);
+              let groupId = null;
+              try {
+                const profRes = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+                if (profRes.ok) {
+                  const prof = await profRes.json();
+                  groupId = (prof?.Data || prof?.data)?.Group || null;
+                }
+              } catch {}
+
+              await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId: ib.id, commissionMap, groupId });
               await IBTradeHistory.calculateIBCommissions(accountId, ib.id);
             }
           } catch (error) {
@@ -267,9 +278,9 @@ async function start() {
       console.log(`Socket.IO server is ready`);
       console.log(`Environment: ${process.env.NODE_ENV}`);
       
-      // Start auto-sync job (every 15 minutes)
-      console.log('[Auto-Sync] Scheduling auto-sync job every 15 minutes');
-      setInterval(autoSyncTrades, 15 * 60 * 1000); // 15 minutes
+      // Start auto-sync job (every 5 minutes)
+      console.log('[Auto-Sync] Scheduling auto-sync job every 5 minutes');
+      setInterval(autoSyncTrades, 5 * 60 * 1000); // 5 minutes
       
       // Run initial sync after 1 minute
       setTimeout(autoSyncTrades, 60 * 1000);
