@@ -1161,6 +1161,8 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
     
     // Filter out demo accounts - only show real/live accounts
     const realAccounts = accounts.filter(acc => !acc.isDemo);
+    // Whitelist of allowed accounts for this user; used to filter trade aggregates
+    const allowedAccounts = new Set(realAccounts.map(a => String(a.accountId)));
     
     for (const acc of realAccounts) {
       totals.totalBalance += acc.balance;
@@ -1241,10 +1243,13 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
     const perAccountStats = new Map(); // {trade_count, total_volume, total_profit, total_ib_commission}
 
     for (const row of tradesRes.rows) {
+      // Skip trades that do not belong to any current (real) account of this user
+      const rowAccId = String(row.account_id);
+      if (!allowedAccounts.has(rowAccId)) continue;
       const key = normalize(row.group_id);
       if (!approvedMap[key]) continue; // skip unapproved groups
 
-      const accId = String(row.account_id);
+      const accId = rowAccId;
       const prev = accountCommissionMap.get(accId) || { totalCommission: 0, tradeCount: 0 };
       prev.totalCommission += Number(row.ib_commission || 0);
       prev.tradeCount += 1;
