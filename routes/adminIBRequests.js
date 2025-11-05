@@ -1178,6 +1178,12 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       [id]
     );
     const eligibleGroups = new Map();
+    const normalizeKey = (gid) => {
+      if (!gid) return '';
+      const s = String(gid).toLowerCase();
+      const parts = s.split(/[\\/]/);
+      return parts[parts.length - 1] || s;
+    };
     commissionStructuresResult.rows.forEach(row => {
       if (row.group_id) {
         const groupIdLower = String(row.group_id).toLowerCase();
@@ -1197,19 +1203,26 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
             spreadSharePercentage: Number(row.spread_share_percentage || 0)
           });
         }
+
+        // Also store a normalized key using only the trailing segment (e.g., dynamic-2000x-10P)
+        const shortKey = normalizeKey(groupIdLower);
+        if (shortKey && !eligibleGroups.has(shortKey)) {
+          eligibleGroups.set(shortKey, {
+            structureName: row.structure_name,
+            usdPerLot: Number(row.usd_per_lot || 0),
+            spreadSharePercentage: Number(row.spread_share_percentage || 0)
+          });
+        }
       }
     });
 
-    // Filter trades to approved groups only, and only from the approved date forward
-    const approvedAtRes = await query('SELECT approved_at FROM ib_requests WHERE id = $1::int', [id]);
-    const approvedAt = approvedAtRes.rows[0]?.approved_at || null;
-
+    // Fetch trades for this IB (closed positions with non-zero P&L).
+    // Admin view should reflect all historical trades; do not restrict by approval date.
     const tradesRes = await query(
       `SELECT account_id, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, created_at
        FROM ib_trade_history
-       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
-         AND ($2::timestamp IS NULL OR COALESCE(updated_at, synced_at, created_at, CURRENT_TIMESTAMP) >= $2)`,
-      [id, approvedAt]
+       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+      [id]
     );
 
     const normalize = (gid) => {
