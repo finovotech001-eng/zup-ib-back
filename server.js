@@ -17,6 +17,8 @@ import { MT5Groups } from './models/MT5Groups.js';
 import { GroupCommissionStructures } from './models/GroupCommissionStructures.js';
 import { IBGroupAssignment } from './models/IBGroupAssignment.js';
 import { IBTradeHistory } from './models/IBTradeHistory.js';
+import { IBWithdrawal } from './models/IBWithdrawal.js';
+// import { IBLevelUpHistory } from './models/IBLevelUpHistory.js'; // File removed
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -27,6 +29,14 @@ import adminSymbolsRoutes from './routes/adminSymbols.js';
 import adminSymbolsWithCategoriesRoutes from './routes/adminSymbolsWithCategories.js';
 import chatRoutes from './routes/chat.js';
 import mt5TradesRoutes from './routes/mt5Trades.js';
+import adminTradingGroupsRoutes from './routes/adminTradingGroups.js';
+import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
+import adminIBUpgradeRoutes from './routes/adminIBUpgrade.js';
+// User-facing routes
+import userClientsRoutes from './routes/userClients.js';
+import userSymbolsRoutes from './routes/userSymbols.js';
+import userProfileRoutes from './routes/userProfile.js';
+import userPaymentsRoutes from './routes/userPayments.js';
 
 
 dotenv.config();
@@ -69,6 +79,8 @@ async function initializeDatabase() {
     await GroupCommissionStructures.createTable();
     await IBGroupAssignment.createTable();
     await IBTradeHistory.createTable();
+    await IBWithdrawal.createTable();
+    // await IBLevelUpHistory.createTable(); // File removed
     await IBAdmin.seedDefaultAdmin();
     console.log('Database tables initialized successfully');
   } catch (error) {
@@ -85,6 +97,14 @@ app.use('/api/admin/symbols', adminSymbolsRoutes);
 app.use('/api/admin/symbols-with-categories', adminSymbolsWithCategoriesRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/admin/mt5-trades', mt5TradesRoutes);
+app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
+app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
+app.use('/api/admin/ib-upgrade', adminIBUpgradeRoutes);
+// Mount user-facing routes
+app.use('/api/user/clients', userClientsRoutes);
+app.use('/api/user/symbols', userSymbolsRoutes);
+app.use('/api/user', userProfileRoutes);
+app.use('/api/user', userPaymentsRoutes);
 
 
 // Health check endpoint
@@ -234,7 +254,7 @@ async function autoSyncTrades() {
           const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
           try {
-            const apiUrl = `http://18.175.242.21:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+            const apiUrl = `http://18.175.242.21:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
             const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
 
             if (response.ok) {

@@ -1,0 +1,53 @@
+Connected to PostgreSQL database
+ib_trade_history table already exists; ensuring schema
+✅ ib_trade_history table created successfully
+Database tables initialized successfully
+IB Portal Server is running on port 5000
+Socket.IO server is ready
+Environment: development
+[Auto-Sync] Scheduling auto-sync job every 5 minutes
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+Connected to PostgreSQL database
+Connected to PostgreSQL database
+Connected to PostgreSQL database
+User connected: IBH1jWKHnWevgzFEAAAC
+User joined: {
+  userId: 1,
+  name: 'finovotech001@gmail.com',
+  email: 'finovotech001@gmail.com'
+}
+User disconnected: IBH1jWKHnWevgzFEAAAC
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+User connected: aG50MX6O0YReWQXfAAAF
+User joined: {
+  userId: 1,
+  name: 'finovotech001@gmail.com',
+  email: 'finovotech001@gmail.com'
+}
+User disconnected: aG50MX6O0YReWQXfAAAF
+User connected: oRxu_iF08cb1K9NrAAAH
+User joined: {
+  userId: 1,
+  name: 'finovotech001@gmail.com',
+  email: 'finovotech001@gmail.com'
+}
+User disconnected: oRxu_iF08cb1K9NrAAAH
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed
+[Auto-Sync] Starting trade sync for all approved IB users...
+Connected to PostgreSQL database
+[Auto-Sync] Trade sync completed

@@ -75,6 +75,26 @@ export class IBGroupAssignment {
     );
     return result.rows;
   }
+
+  /**
+   * Update structure for a specific assignment
+   */
+  static async updateStructure(assignmentId, structureId, structureName, usdPerLot, spreadSharePercentage) {
+    const result = await query(
+      `
+        UPDATE ib_group_assignments
+        SET structure_id = $2,
+            structure_name = $3,
+            usd_per_lot = $4,
+            spread_share_percentage = $5,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        RETURNING *
+      `,
+      [assignmentId, structureId, structureName, usdPerLot, spreadSharePercentage]
+    );
+    return result.rows[0];
+  }
 }
 
 export default IBGroupAssignment;

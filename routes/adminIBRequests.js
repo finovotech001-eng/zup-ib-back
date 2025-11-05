@@ -4,6 +4,7 @@
 import { GroupCommissionStructures } from '../models/GroupCommissionStructures.js';
 import { IBGroupAssignment } from '../models/IBGroupAssignment.js';
 import { IBTradeHistory } from '../models/IBTradeHistory.js';
+// import { IBLevelUpHistory } from '../models/IBLevelUpHistory.js'; // File removed
  import { authenticateAdminToken } from './adminAuth.js';
  import { query } from '../config/database.js';
 
@@ -20,17 +21,100 @@ router.get('/', authenticateAdminToken, async (req, res) => {
     const offset = (page - 1) * limit;
 
     let requests;
+    let countResult;
+    
+    // Query with LEFT JOIN to get referrer information
     if (status && status !== 'all') {
       const result = await query(
-        `SELECT * FROM ib_requests WHERE status = $1 ORDER BY submitted_at DESC LIMIT $2 OFFSET $3`,
+        `
+          SELECT 
+            ir.*,
+            ref.full_name as referrer_name,
+            ref.email as referrer_email,
+            ref.referral_code as referrer_code
+          FROM ib_requests ir
+          LEFT JOIN ib_requests ref ON ir.referred_by = ref.id
+          WHERE ir.status = $1 
+          ORDER BY ir.submitted_at DESC 
+          LIMIT $2 OFFSET $3
+        `,
         [status, limit, offset]
       );
-      requests = result.rows.map(record => IBRequest.stripSensitiveFields(record));
+      
+      // Fetch commission structure names for each request
+      const requestsWithStructures = await Promise.all(
+        result.rows.map(async (record) => {
+          const stripped = IBRequest.stripSensitiveFields(record);
+          
+          // Get commission structure names from group assignments
+          let commissionStructures = [];
+          if (record.status === 'approved') {
+            const assignments = await IBGroupAssignment.getByIbRequestId(record.id);
+            commissionStructures = assignments
+              .filter(a => a.structure_name)
+              .map(a => a.structure_name);
+          }
+          
+          return {
+            ...stripped,
+            referrer: record.referred_by ? {
+              name: record.referrer_name,
+              email: record.referrer_email,
+              referralCode: record.referrer_code
+            } : null,
+            commissionStructures: commissionStructures.length > 0 ? commissionStructures : null
+          };
+        })
+      );
+      
+      requests = requestsWithStructures;
+      countResult = await query('SELECT COUNT(*) FROM ib_requests WHERE status = $1', [status]);
     } else {
-      requests = await IBRequest.findAll(limit, offset);
+      const result = await query(
+        `
+          SELECT 
+            ir.*,
+            ref.full_name as referrer_name,
+            ref.email as referrer_email,
+            ref.referral_code as referrer_code
+          FROM ib_requests ir
+          LEFT JOIN ib_requests ref ON ir.referred_by = ref.id
+          ORDER BY ir.submitted_at DESC 
+          LIMIT $1 OFFSET $2
+        `,
+        [limit, offset]
+      );
+      
+      // Fetch commission structure names for each request
+      const requestsWithStructures = await Promise.all(
+        result.rows.map(async (record) => {
+          const stripped = IBRequest.stripSensitiveFields(record);
+          
+          // Get commission structure names from group assignments
+          let commissionStructures = [];
+          if (record.status === 'approved') {
+            const assignments = await IBGroupAssignment.getByIbRequestId(record.id);
+            commissionStructures = assignments
+              .filter(a => a.structure_name)
+              .map(a => a.structure_name);
+          }
+          
+          return {
+            ...stripped,
+            referrer: record.referred_by ? {
+              name: record.referrer_name,
+              email: record.referrer_email,
+              referralCode: record.referrer_code
+            } : null,
+            commissionStructures: commissionStructures.length > 0 ? commissionStructures : null
+          };
+        })
+      );
+      
+      requests = requestsWithStructures;
+      countResult = await query('SELECT COUNT(*) FROM ib_requests');
     }
 
-    const countResult = await query('SELECT COUNT(*) FROM ib_requests');
     const totalCount = Number.parseInt(countResult.rows[0].count, 10) || 0;
 
     res.json({
@@ -199,7 +283,14 @@ router.get('/approval-options', authenticateAdminToken, async (req, res) => {
 
     // Group structures by group_id
     const groupsWithStructures = groups.map(group => {
-      const groupStructures = structures.filter(structure => structure.group_id === group.group_id);
+      const groupStructures = structures
+        .filter(structure => structure.group_id === group.group_id)
+        .map(structure => ({
+          ...structure,
+          // Ensure structure_name is available (handle both snake_case and camelCase)
+          structure_name: structure.structure_name || structure.structureName,
+          structureName: structure.structure_name || structure.structureName
+        }));
       return {
         ...group,
         commissionStructures: groupStructures
@@ -247,6 +338,45 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
   }
 });
 
+  // Update referral code for an IB
+  router.put('/:id/referral-code', authenticateAdminToken, async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { referralCode } = req.body;
+
+      if (!referralCode || typeof referralCode !== 'string') {
+        return res.status(400).json({
+          success: false,
+          message: 'Referral code is required'
+        });
+      }
+
+      const updatedRequest = await IBRequest.updateReferralCode(id, referralCode);
+
+      if (!updatedRequest) {
+        return res.status(404).json({
+          success: false,
+          message: 'IB request not found'
+        });
+      }
+
+      res.json({
+        success: true,
+        message: 'Referral code updated successfully',
+        data: {
+          request: updatedRequest
+        }
+      });
+    } catch (error) {
+      console.error('Update referral code error:', error);
+      res.status(400).json({
+        success: false,
+        message: error.message || 'Unable to update referral code',
+        error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined
+      });
+    }
+  });
+
   // Update IB request status (approve/reject/ban)
   router.put('/:id/status', authenticateAdminToken, async (req, res) => {
     try {
@@ -263,7 +393,9 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
       }
 
       let normalizedIbType = null;
-      if (typeof ibType === 'string' && ibType.trim()) {
+      // Only validate ibType if it's provided and we're not using commission structures
+      // When groups are provided, we'll use commission structure names instead
+      if (typeof ibType === 'string' && ibType.trim() && !groups) {
         const trimmedType = ibType.trim().toLowerCase();
         if (!ALLOWED_IB_TYPES.includes(trimmedType)) {
           return res.status(400).json({
@@ -307,13 +439,53 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
         // For multiple groups, we'll use the first group's data for the main IB record
         // and store additional groups data separately
         const firstGroup = groups[0];
+        
+        // Extract commission structure names from all groups for ib_type
+        // First, try to get structure names from the groups data
+        let structureNames = groups
+          .map(g => g.structureName)
+          .filter(name => name && name !== 'Custom');
+        
+        // If structure names are missing, fetch them from database
+        if (structureNames.length === 0 || structureNames.some(n => !n)) {
+          const structureNamesPromises = groups.map(async (group) => {
+            if (group.structureId) {
+              try {
+                const structureResult = await query(
+                  'SELECT structure_name FROM group_commission_structures WHERE id = $1',
+                  [group.structureId]
+                );
+                if (structureResult.rows.length > 0) {
+                  return structureResult.rows[0].structure_name;
+                }
+              } catch (error) {
+                console.error(`Error fetching structure name for structureId ${group.structureId}:`, error);
+              }
+            }
+            return group.structureName;
+          });
+          
+          structureNames = await Promise.all(structureNamesPromises);
+          structureNames = structureNames.filter(name => name && name !== 'Custom');
+        }
+        
+        // Use commission structure names for ib_type, or fallback to normalizedIbType
+        // Note: finalIbType can be a comma-separated string like "Gold, Classic"
+        // This is allowed even though it's not in ALLOWED_IB_TYPES - it's the actual structure names
+        // If no structure names found, use null instead of 'common' to allow NULL in database
+        const finalIbType = structureNames.length > 0 
+          ? structureNames.join(', ') 
+          : (normalizedIbType || null);
+        
+        console.log(`[APPROVE] Setting ib_type to: "${finalIbType}" for IB ${id}`);
+        
         const updatedRequest = await IBRequest.updateStatus(
           id,
           status,
           adminComments,
           firstGroup.usdPerLot,
           firstGroup.spreadSharePercentage,
-          normalizedIbType,
+          finalIbType, // This can be "Gold, Classic" or any structure name(s)
           firstGroup.groupId,
           structureId
         );
@@ -325,14 +497,80 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
           });
         }
 
-        await IBGroupAssignment.replaceAssignments(id, groups.map((group) => ({
-          groupId: group.groupId,
-          groupName: group.groupName,
-          structureId: group.structureId,
-          structureName: group.structureName,
-          usdPerLot: group.usdPerLot,
-          spreadSharePercentage: group.spreadSharePercentage
-        })));
+        // Save group assignments with structure names
+        const assignments = groups.map((group) => {
+          // If structureName is not provided, fetch it from the database using structureId
+          let structureName = group.structureName;
+          
+          // If structureName is missing or 'Custom', try to fetch from database
+          if ((!structureName || structureName === 'Custom') && group.structureId) {
+            // This will be handled async, but for now we'll use what's provided
+            // The frontend should always send the structure name
+          }
+          
+          console.log(`[APPROVE] Saving assignment for IB ${id}:`, {
+            groupId: group.groupId,
+            groupName: group.groupName,
+            structureId: group.structureId,
+            structureName: group.structureName,
+            usdPerLot: group.usdPerLot,
+            spreadSharePercentage: group.spreadSharePercentage
+          });
+          
+          return {
+            groupId: group.groupId,
+            groupName: group.groupName,
+            structureId: group.structureId,
+            structureName: group.structureName || null, // Save null if not provided, we'll fetch it
+            usdPerLot: group.usdPerLot,
+            spreadSharePercentage: group.spreadSharePercentage
+          };
+        });
+        
+        await IBGroupAssignment.replaceAssignments(id, assignments);
+        
+        // If any assignments are missing structure names, fetch and update them
+        const assignmentsToUpdate = await Promise.all(
+          assignments.map(async (assignment) => {
+            if (!assignment.structureName && assignment.structureId) {
+              try {
+                const structureResult = await query(
+                  'SELECT structure_name FROM group_commission_structures WHERE id = $1',
+                  [assignment.structureId]
+                );
+                if (structureResult.rows.length > 0) {
+                  return {
+                    ...assignment,
+                    structureName: structureResult.rows[0].structure_name
+                  };
+                }
+              } catch (error) {
+                console.error(`Error fetching structure name for structureId ${assignment.structureId}:`, error);
+              }
+            }
+            return assignment;
+          })
+        );
+        
+        // If any were updated, save again
+        const needsUpdate = assignmentsToUpdate.some((a, idx) => a.structureName !== assignments[idx].structureName);
+        if (needsUpdate) {
+          await IBGroupAssignment.replaceAssignments(id, assignmentsToUpdate);
+          
+          // Also update ib_type in ib_requests if structure names were fetched
+          const updatedStructureNames = assignmentsToUpdate
+            .map(a => a.structureName)
+            .filter(name => name);
+          
+          if (updatedStructureNames.length > 0) {
+            const finalIbType = updatedStructureNames.join(', ');
+            await query(
+              'UPDATE ib_requests SET ib_type = $1 WHERE id = $2',
+              [finalIbType, id]
+            );
+            console.log(`[APPROVE] Updated ib_type to: ${finalIbType} for IB ${id}`);
+          }
+        }
 
         res.json({
           success: true,
@@ -442,13 +680,181 @@ router.get('/:id', authenticateAdminToken, async (req, res) => {
       }
     } catch (error) {
       console.error('Update IB request status error:', error);
+      console.error('Error stack:', error.stack);
       res.status(500).json({
         success: false,
         message: 'Unable to update IB request status',
-        error: error?.message ?? null
+        error: process.env.NODE_ENV !== 'production' ? (error?.message || String(error)) : undefined,
+        details: process.env.NODE_ENV !== 'production' ? {
+          stack: error?.stack,
+          name: error?.name
+        } : undefined
       });
     }
   });
+
+// Update commission structures for an approved IB
+router.put('/:id/commission-structures', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { groups } = req.body;
+
+    // Check if IB is approved
+    const ibCheck = await query('SELECT id, status FROM ib_requests WHERE id = $1', [id]);
+    if (ibCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'IB request not found'
+      });
+    }
+
+    if (ibCheck.rows[0].status !== 'approved') {
+      return res.status(400).json({
+        success: false,
+        message: 'Commission structures can only be updated for approved IBs'
+      });
+    }
+
+    // Validate groups data
+    if (!groups || !Array.isArray(groups) || groups.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'At least one group must be selected'
+      });
+    }
+
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const usdValue = Number(group.usdPerLot);
+      const spreadValue = Number(group.spreadSharePercentage);
+
+      if (!Number.isFinite(usdValue) || !Number.isFinite(spreadValue)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid commission values for group ${group.groupName || `at index ${i + 1}`}`
+        });
+      }
+
+      if (usdValue < 0 || spreadValue < 0 || spreadValue > 100) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid commission values for group ${group.groupName || `at index ${i + 1}`}`
+        });
+      }
+    }
+
+    // Extract commission structure names
+    let structureNames = groups
+      .map(g => g.structureName)
+      .filter(name => name && name !== 'Custom');
+
+    // If structure names are missing, fetch them from database
+    if (structureNames.length === 0 || structureNames.some(n => !n)) {
+      const structureNamesPromises = groups.map(async (group) => {
+        if (group.structureId) {
+          try {
+            const structureResult = await query(
+              'SELECT structure_name FROM group_commission_structures WHERE id = $1',
+              [group.structureId]
+            );
+            if (structureResult.rows.length > 0) {
+              return structureResult.rows[0].structure_name;
+            }
+          } catch (error) {
+            console.error(`Error fetching structure name for structureId ${group.structureId}:`, error);
+          }
+        }
+        return group.structureName;
+      });
+
+      structureNames = await Promise.all(structureNamesPromises);
+      structureNames = structureNames.filter(name => name && name !== 'Custom');
+    }
+
+    // Update ib_type with commission structure names
+    const finalIbType = structureNames.length > 0 
+      ? structureNames.join(', ') 
+      : null;
+
+    if (finalIbType) {
+      await query('UPDATE ib_requests SET ib_type = $1 WHERE id = $2', [finalIbType, id]);
+      console.log(`[UPDATE COMMISSION] Updated ib_type to: "${finalIbType}" for IB ${id}`);
+    }
+
+    // Save group assignments with structure names
+    const assignments = groups.map((group) => {
+      return {
+        groupId: group.groupId,
+        groupName: group.groupName,
+        structureId: group.structureId,
+        structureName: group.structureName || null,
+        usdPerLot: group.usdPerLot,
+        spreadSharePercentage: group.spreadSharePercentage
+      };
+    });
+
+    await IBGroupAssignment.replaceAssignments(id, assignments);
+
+    // If any assignments are missing structure names, fetch and update them
+    const assignmentsToUpdate = await Promise.all(
+      assignments.map(async (assignment) => {
+        if (!assignment.structureName && assignment.structureId) {
+          try {
+            const structureResult = await query(
+              'SELECT structure_name FROM group_commission_structures WHERE id = $1',
+              [assignment.structureId]
+            );
+            if (structureResult.rows.length > 0) {
+              return {
+                ...assignment,
+                structureName: structureResult.rows[0].structure_name
+              };
+            }
+          } catch (error) {
+            console.error(`Error fetching structure name for structureId ${assignment.structureId}:`, error);
+          }
+        }
+        return assignment;
+      })
+    );
+
+    // If any were updated, save again
+    const needsUpdate = assignmentsToUpdate.some((a, idx) => a.structureName !== assignments[idx].structureName);
+    if (needsUpdate) {
+      await IBGroupAssignment.replaceAssignments(id, assignmentsToUpdate);
+
+      // Also update ib_type if structure names were fetched
+      const updatedStructureNames = assignmentsToUpdate
+        .map(a => a.structureName)
+        .filter(name => name);
+
+      if (updatedStructureNames.length > 0) {
+        const finalIbType = updatedStructureNames.join(', ');
+        await query('UPDATE ib_requests SET ib_type = $1 WHERE id = $2', [finalIbType, id]);
+        console.log(`[UPDATE COMMISSION] Updated ib_type to: ${finalIbType} for IB ${id}`);
+      }
+    }
+
+    // Get updated profile
+    const updatedRequest = await IBRequest.findById(id);
+
+    res.json({
+      success: true,
+      message: `Commission structures updated successfully for ${groups.length} group${groups.length !== 1 ? 's' : ''}`,
+      data: {
+        request: IBRequest.stripSensitiveFields(updatedRequest)
+      }
+    });
+  } catch (error) {
+    console.error('Update commission structures error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to update commission structures',
+      error: process.env.NODE_ENV !== 'production' ? (error?.message || String(error)) : undefined
+    });
+  }
+});
 
 // Get commission structures for a group
 router.get('/groups/*/commissions', authenticateAdminToken, async (req, res) => {
@@ -555,7 +961,12 @@ router.get('/profiles/approved', authenticateAdminToken, async (req, res) => {
 // Get single IB profile by ID
 router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
   try {
-    const { id } = req.params;
+    // Ensure numeric id for robust parameter typing across PG
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
 
     const result = await query(
       `
@@ -571,9 +982,10 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
           spread_percentage_per_lot,
           admin_comments,
           group_id,
-          structure_id
+          structure_id,
+          referral_code
         FROM ib_requests
-        WHERE id = $1 AND LOWER(TRIM(status)) = 'approved'
+        WHERE id = $1::int
       `,
       [id]
     );
@@ -581,13 +993,29 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
-        message: 'Approved IB profile not found'
+        message: 'IB profile not found'
       });
     }
 
     const record = result.rows[0];
-    const phone = await getUserPhone(record.email);
-    const groups = await getGroupAssignments(record);
+    // Make all expensive fetches resilient so a single failure doesn't 500 the page
+    let phone = null; let groups = []; let acctStats = null; let tradingAccounts = []; let tradeHistory = []; let treeStructure = null; let levelUpHistory = [];
+    try { phone = await getUserPhone(record.email); } catch (e) { console.warn('getUserPhone error:', e.message); }
+    try { groups = await getGroupAssignments(record); } catch (e) { console.warn('getGroupAssignments error:', e.message); groups = []; }
+
+    // Level-up history removed in this build
+    levelUpHistory = [];
+
+    // Get commission structure names from groups
+    const commissionStructures = groups
+      .filter(g => g.structureName)
+      .map(g => g.structureName);
+
+    // Fetch additional sections defensively
+    try { acctStats = await getAccountStats(record.id); } catch (e) { console.warn('getAccountStats error:', e.message); acctStats = { totalAccounts: 0, totalBalance: 0, totalEquity: 0 }; }
+    try { tradingAccounts = await getTradingAccounts(record.id); } catch (e) { console.warn('getTradingAccounts error:', e.message); tradingAccounts = []; }
+    try { tradeHistory = await getTradeHistory(record.id); } catch (e) { console.warn('getTradeHistory error:', e.message); tradeHistory = []; }
+    try { treeStructure = await getTreeStructure(record.id); } catch (e) { console.warn('getTreeStructure error:', e.message); treeStructure = { ownLots: 0, teamLots: 0, totalTrades: 0, root: null }; }
 
     const profile = {
       id: record.id,
@@ -595,16 +1023,26 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
       fullName: record.full_name,
       email: record.email,
       phone,
-      ibType: record.ib_type,
+      ibType: commissionStructures.length > 0 ? commissionStructures.join(', ') : (record.ib_type || 'Common'),
+      commissionStructures: commissionStructures.length > 0 ? commissionStructures : null,
       usdPerLot: Number(record.usd_per_lot || 0),
       spreadPercentagePerLot: Number(record.spread_percentage_per_lot || 0),
       approvedDate: record.approved_at,
       adminComments: record.admin_comments,
+      referralCode: record.referral_code,
       groups,
-      accountStats: await getAccountStats(record.id),
-      tradingAccounts: await getTradingAccounts(record.id),
-      tradeHistory: await getTradeHistory(record.id),
-      treeStructure: await getTreeStructure(record.id)
+      accountStats: acctStats,
+      tradingAccounts,
+      tradeHistory,
+      treeStructure,
+      levelUpHistory: levelUpHistory.map(h => ({
+        id: h.id,
+        fromStructure: h.from_structure_name,
+        toStructure: h.to_structure_name,
+        tradingVolume: Number(h.trading_volume_at_upgrade || 0),
+        activeClients: h.active_clients_at_upgrade,
+        upgradedAt: h.upgraded_at
+      }))
     };
 
     res.json({
@@ -625,8 +1063,12 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
 // Account statistics (live MT5 balances)
 router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, res) => {
   try {
-    const { id } = req.params;
-    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [id]);
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1::int', [id]);
     if (ibResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'IB not found' });
     }
@@ -674,6 +1116,17 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       const balance = Number(payload?.Balance ?? payload?.balance ?? 0);
       const equity = Number(payload?.Equity ?? payload?.equity ?? 0);
       let groupName = payload?.Group ?? payload?.group ?? payload?.GroupName ?? payload?.group_name ?? 'Unknown';
+      
+      // Get account type from API response
+      const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? null;
+      
+      // Check if account is demo by group name or account type
+      const groupIdFull = payload?.Group || payload?.group || '';
+      const isDemo = 
+        (accountType && String(accountType).toLowerCase().includes('demo')) ||
+        (groupIdFull && String(groupIdFull).toLowerCase().includes('demo')) ||
+        (groupName && String(groupName).toLowerCase().includes('demo'));
+      
       if (typeof groupName === 'string') {
         // Prefer extracting the segment after 'Bbook\'
         const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
@@ -698,17 +1151,152 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
         marginFree: Number(payload?.MarginFree ?? payload?.marginFree ?? 0),
         group: groupName,
         groupId: payload?.Group || payload?.group || null,
+        accountType: accountType || (isDemo ? 'Demo' : 'Live'),
+        isDemo,
         raw: payload
       };
     };
 
     const accounts = await Promise.all(accountsResult.rows.map(r => fetchOne(r.accountId)));
-    for (const acc of accounts) {
+    
+    // Filter out demo accounts - only show real/live accounts
+    const realAccounts = accounts.filter(acc => !acc.isDemo);
+    
+    for (const acc of realAccounts) {
       totals.totalBalance += acc.balance;
       totals.totalEquity += acc.equity;
     }
+    
+    // Update total accounts count to only include real accounts
+    totals.totalAccounts = realAccounts.length;
 
-    const tradeMetrics = await IBTradeHistory.getAccountStats(userId);
+    // Get IB commission structures for this IB
+    const commissionStructuresResult = await query(
+      `SELECT group_id, group_name, structure_name, usd_per_lot, spread_share_percentage 
+       FROM ib_group_assignments 
+       WHERE ib_request_id = $1`,
+      [id]
+    );
+    const eligibleGroups = new Map();
+    commissionStructuresResult.rows.forEach(row => {
+      if (row.group_id) {
+        const groupIdLower = String(row.group_id).toLowerCase();
+        const groupNameLower = row.group_name ? String(row.group_name).toLowerCase() : null;
+        
+        // Store with both group_id and group_name as keys for flexible matching
+        eligibleGroups.set(groupIdLower, {
+          structureName: row.structure_name,
+          usdPerLot: Number(row.usd_per_lot || 0),
+          spreadSharePercentage: Number(row.spread_share_percentage || 0)
+        });
+        
+        if (groupNameLower && groupNameLower !== groupIdLower) {
+          eligibleGroups.set(groupNameLower, {
+            structureName: row.structure_name,
+            usdPerLot: Number(row.usd_per_lot || 0),
+            spreadSharePercentage: Number(row.spread_share_percentage || 0)
+          });
+        }
+      }
+    });
+
+    // Filter trades to approved groups only, and only from the approved date forward
+    const approvedAtRes = await query('SELECT approved_at FROM ib_requests WHERE id = $1::int', [id]);
+    const approvedAt = approvedAtRes.rows[0]?.approved_at || null;
+
+    const tradesRes = await query(
+      `SELECT account_id, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, created_at
+       FROM ib_trade_history
+       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+         AND ($2::timestamp IS NULL OR COALESCE(updated_at, synced_at, created_at, CURRENT_TIMESTAMP) >= $2)`,
+      [id, approvedAt]
+    );
+
+    const normalize = (gid) => {
+      if (!gid) return '';
+      const s = String(gid).toLowerCase().trim();
+      const parts = s.split(/[\\/]/);
+      return parts[parts.length - 1] || s;
+    };
+
+    const approvedMap = {};
+    for (const [k, v] of eligibleGroups.entries()) {
+      approvedMap[k] = v; // keys already lowercased elsewhere
+    }
+
+    const accountCommissionMap = new Map();
+    const perAccountStats = new Map(); // {trade_count, total_volume, total_profit, total_ib_commission}
+
+    for (const row of tradesRes.rows) {
+      const key = normalize(row.group_id);
+      if (!approvedMap[key]) continue; // skip unapproved groups
+
+      const accId = String(row.account_id);
+      const prev = accountCommissionMap.get(accId) || { totalCommission: 0, tradeCount: 0 };
+      prev.totalCommission += Number(row.ib_commission || 0);
+      prev.tradeCount += 1;
+      accountCommissionMap.set(accId, prev);
+
+      const st = perAccountStats.get(accId) || { account_id: accId, trade_count: 0, total_volume: 0, total_profit: 0, total_ib_commission: 0 };
+      st.trade_count += 1;
+      st.total_volume += Number(row.volume_lots || 0);
+      st.total_profit += Number(row.profit || 0);
+      st.total_ib_commission += Number(row.ib_commission || 0);
+      perAccountStats.set(accId, st);
+    }
+
+    // Add commission data and eligibility to each account
+    const accountsWithCommission = accounts.map(acc => {
+      const accountIdStr = String(acc.accountId);
+      const commissionData = accountCommissionMap.get(accountIdStr) || { totalCommission: 0, tradeCount: 0 };
+      
+      // Check if this account's group is eligible for commission
+      // Try matching both groupId (full path) and group name (extracted)
+      const groupIdLower = acc.groupId ? String(acc.groupId).toLowerCase() : null;
+      const groupNameLower = acc.group ? String(acc.group).toLowerCase() : null;
+      
+      // Extract group name from full path if needed
+      let extractedGroupName = null;
+      if (groupIdLower) {
+        const match = groupIdLower.match(/bbook\\([^\\/]+)/i) || groupIdLower.match(/bbook\\\\([^\\/]+)/i);
+        if (match && match[1]) {
+          extractedGroupName = match[1].toLowerCase();
+        } else if (groupIdLower.includes('\\')) {
+          const parts = groupIdLower.split('\\');
+          extractedGroupName = (parts.length >= 3 ? parts[2] : parts[parts.length - 1]).toLowerCase();
+        } else if (groupIdLower.includes('/')) {
+          const parts = groupIdLower.split('/');
+          extractedGroupName = parts[parts.length - 1].toLowerCase();
+        }
+      }
+      
+      // Try matching: groupId, group name, or extracted group name
+      let isEligible = false;
+      let commissionInfo = null;
+      
+      if (groupIdLower && eligibleGroups.has(groupIdLower)) {
+        isEligible = true;
+        commissionInfo = eligibleGroups.get(groupIdLower);
+      } else if (groupNameLower && eligibleGroups.has(groupNameLower)) {
+        isEligible = true;
+        commissionInfo = eligibleGroups.get(groupNameLower);
+      } else if (extractedGroupName && eligibleGroups.has(extractedGroupName)) {
+        isEligible = true;
+        commissionInfo = eligibleGroups.get(extractedGroupName);
+      }
+
+      return {
+        ...acc,
+        ibCommission: commissionData.totalCommission,
+        tradeCount: commissionData.tradeCount,
+        isEligibleForCommission: isEligible,
+        commissionStructure: commissionInfo?.structureName || null,
+        usdPerLot: commissionInfo?.usdPerLot || 0,
+        spreadSharePercentage: commissionInfo?.spreadSharePercentage || 0
+      };
+    });
+
+    const tradeMetrics = Array.from(perAccountStats.values());
     const summary = tradeMetrics.reduce((acc, row) => {
       acc.totalTrades += Number(row.trade_count || 0);
       acc.totalVolume += Number(row.total_volume || 0);
@@ -717,7 +1305,10 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       return acc;
     }, { totalTrades: 0, totalVolume: 0, totalProfit: 0, totalIbCommission: 0 });
 
-    res.json({ success: true, data: { totals, accounts, trades: tradeMetrics, tradeSummary: summary } });
+    // Filter out demo accounts from the final response
+    const realAccountsWithCommission = accountsWithCommission.filter(acc => !acc.isDemo);
+    
+    res.json({ success: true, data: { totals, accounts: realAccountsWithCommission, trades: tradeMetrics, tradeSummary: summary } });
   } catch (error) {
     console.error('Fetch account stats error:', error);
     res.status(500).json({ success: false, message: 'Unable to fetch account statistics' });
@@ -727,10 +1318,14 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
 // Trade history for IB profile
 router.get('/profiles/:id/trades', authenticateAdminToken, async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
     const { accountId, page = 1, pageSize = 50, sync } = req.query;
 
-    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [id]);
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1::int', [id]);
     if (ibResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'IB not found' });
     }
@@ -798,12 +1393,51 @@ async function getGroupAssignments(record) {
       }));
       // Enrich with live totals from ib_trade_history aggregated by current account groups
       const aggregates = await computeGroupAggregates(record.id, record.email);
-      return groups.map(g => ({
-        ...g,
-        totalCommission: Number(aggregates[g.groupId]?.totalCommission || 0),
-        totalLots: Number(aggregates[g.groupId]?.totalLots || 0),
-        totalVolume: Number(aggregates[g.groupId]?.totalLots || 0)
-      }));
+      
+      // Helper function to normalize group IDs for matching
+      const normalizeGroupId = (groupId) => {
+        if (!groupId) return '';
+        const normalized = String(groupId).toLowerCase().trim();
+        // Extract last meaningful segment (after last / or \)
+        const parts = normalized.split(/[\/\\]/);
+        return parts[parts.length - 1] || normalized;
+      };
+      
+      return groups.map(g => {
+        // Try to find matching aggregate by exact match or normalized match
+        const groupIdLower = String(g.groupId || '').toLowerCase();
+        const groupNameLower = String(g.groupName || '').toLowerCase();
+        const normalizedGroupId = normalizeGroupId(g.groupId);
+        
+        let matchedAggregate = null;
+        
+        // Try exact match first
+        if (aggregates[g.groupId]) {
+          matchedAggregate = aggregates[g.groupId];
+        } else if (aggregates[groupIdLower]) {
+          matchedAggregate = aggregates[groupIdLower];
+        } else if (aggregates[groupNameLower]) {
+          matchedAggregate = aggregates[groupNameLower];
+        } else {
+          // Try normalized match
+          for (const [key, value] of Object.entries(aggregates)) {
+            const normalizedKey = normalizeGroupId(key);
+            if (normalizedKey === normalizedGroupId || normalizedKey === groupNameLower) {
+              matchedAggregate = value;
+              break;
+            }
+          }
+        }
+        
+        return {
+          ...g,
+          totalCommission: Number(matchedAggregate?.totalCommission || 0),
+          totalLots: Number(matchedAggregate?.totalLots || 0),
+          totalVolume: Number(matchedAggregate?.totalVolume || 0),
+          totalProfit: Number(matchedAggregate?.totalProfit || 0),
+          totalTrades: Number(matchedAggregate?.totalTrades || 0)
+        };
+      });
     }
 
     if (!record.group_id) {
@@ -839,12 +1473,50 @@ async function getGroupAssignments(record) {
       }
     ];
     const aggregates = await computeGroupAggregates(record.id, record.email);
-    return groups.map(g => ({
-      ...g,
-      totalCommission: Number(aggregates[g.groupId]?.totalCommission || 0),
-      totalLots: Number(aggregates[g.groupId]?.totalLots || 0),
-      totalVolume: Number(aggregates[g.groupId]?.totalLots || 0)
-    }));
+    
+    // Helper function to normalize group IDs for matching
+    const normalizeGroupId = (groupId) => {
+      if (!groupId) return '';
+      const normalized = String(groupId).toLowerCase().trim();
+      // Extract last meaningful segment (after last / or \)
+      const parts = normalized.split(/[\/\\]/);
+      return parts[parts.length - 1] || normalized;
+    };
+    
+    return groups.map(g => {
+      // Try to find matching aggregate by exact match or normalized match
+      const groupIdLower = String(g.groupId || '').toLowerCase();
+      const groupNameLower = String(g.groupName || '').toLowerCase();
+      const normalizedGroupId = normalizeGroupId(g.groupId);
+      
+      let matchedAggregate = null;
+      
+      // Try exact match first
+      if (aggregates[g.groupId]) {
+        matchedAggregate = aggregates[g.groupId];
+      } else if (aggregates[groupIdLower]) {
+        matchedAggregate = aggregates[groupIdLower];
+      } else if (aggregates[groupNameLower]) {
+        matchedAggregate = aggregates[groupNameLower];
+      } else {
+        // Try normalized match
+        for (const [key, value] of Object.entries(aggregates)) {
+          const normalizedKey = normalizeGroupId(key);
+          if (normalizedKey === normalizedGroupId || normalizedKey === groupNameLower) {
+            matchedAggregate = value;
+            break;
+          }
+        }
+      }
+      
+      return {
+        ...g,
+        totalCommission: Number(matchedAggregate?.totalCommission || 0),
+        totalLots: Number(matchedAggregate?.totalLots || 0),
+        totalVolume: Number(matchedAggregate?.totalVolume || 0),
+        totalProfit: Number(matchedAggregate?.totalProfit || 0)
+      };
+    });
   } catch (error) {
     console.error('Error fetching group assignments:', error);
     return [];
@@ -864,6 +1536,7 @@ async function computeGroupAggregates(ibId, ibEmail) {
     if (!accountsRes.rows.length) return {};
 
     // Build map accountId -> groupId (full path) via ClientProfile (parallel for speed)
+    // Only include real/live accounts, exclude demo accounts
     const accountToGroup = {};
     const profilePromises = accountsRes.rows.map(async (row) => {
       const accountId = row.accountId;
@@ -872,8 +1545,21 @@ async function computeGroupAggregates(ibId, ibEmail) {
         if (res.ok) {
           const data = await res.json();
           const payload = data?.Data || data?.data || null;
+          if (!payload) return;
+          
+          // Check if account is demo
+          const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? null;
           const groupId = payload?.Group || payload?.group || null;
-          if (groupId) accountToGroup[String(accountId)] = groupId;
+          const groupIdLower = groupId ? String(groupId).toLowerCase() : '';
+          
+          const isDemo = 
+            (accountType && String(accountType).toLowerCase().includes('demo')) ||
+            (groupIdLower && groupIdLower.includes('demo'));
+          
+          // Only add real/live accounts
+          if (!isDemo && groupId) {
+            accountToGroup[String(accountId)] = groupId;
+          }
         }
       } catch {}
     });
@@ -881,22 +1567,80 @@ async function computeGroupAggregates(ibId, ibEmail) {
 
     if (!Object.keys(accountToGroup).length) return {};
 
-    // Sum lots and commissions per account from DB, then fold by groupId
+    // Sum lots, commissions, profit, and trade count per account from DB, then fold by groupId (only closed deals with P&L)
     const tradesRes = await query(
-      `SELECT account_id, COALESCE(SUM(volume_lots),0) AS total_lots, COALESCE(SUM(ib_commission),0) AS total_commission
-       FROM ib_trade_history WHERE ib_request_id = $1 GROUP BY account_id`,
+      `SELECT account_id, 
+              COALESCE(SUM(volume_lots),0) AS total_lots, 
+              COALESCE(SUM(ib_commission),0) AS total_commission,
+              COALESCE(SUM(profit),0) AS total_profit,
+              COUNT(*)::int AS trade_count
+       FROM ib_trade_history 
+       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+       GROUP BY account_id`,
       [ibId]
     );
 
+    // Also get account profits from MT5 API (current account profit/loss) - only for real accounts
+    const accountProfits = {};
+    const profitPromises = Object.keys(accountToGroup).map(async (accountId) => {
+      try {
+        const res = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+        if (res.ok) {
+          const data = await res.json();
+          const payload = data?.Data || data?.data || null;
+          if (!payload) return;
+          
+          // Double-check it's not a demo account (should already be filtered, but just in case)
+          const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? null;
+          const groupId = payload?.Group || payload?.group || '';
+          const isDemo = 
+            (accountType && String(accountType).toLowerCase().includes('demo')) ||
+            (groupId && String(groupId).toLowerCase().includes('demo'));
+          
+          if (!isDemo) {
+            const profit = Number(payload?.Profit || payload?.profit || 0);
+            accountProfits[accountId] = profit;
+          }
+        }
+      } catch {}
+    });
+    await Promise.allSettled(profitPromises);
+
     const totals = tradesRes.rows.reduce((acc, row) => {
       const groupId = accountToGroup[row.account_id];
-      if (!groupId) return acc; // skip if no mapping
-      if (!acc[groupId]) acc[groupId] = { totalLots: 0, totalCommission: 0 };
-      acc[groupId].totalLots += Number(row.total_lots || 0);
-      acc[groupId].totalCommission += Number(row.total_commission || 0);
+      if (!groupId) {
+        console.log(`[computeGroupAggregates] No group mapping for account ${row.account_id}`);
+        return acc; // skip if no mapping
+      }
+      
+      // Store with full path (normalize to lowercase for consistency)
+      const normalizedGroupId = String(groupId).toLowerCase();
+      if (!acc[normalizedGroupId]) {
+        acc[normalizedGroupId] = { totalLots: 0, totalCommission: 0, totalProfit: 0, totalVolume: 0, totalTrades: 0 };
+      }
+      acc[normalizedGroupId].totalLots += Number(row.total_lots || 0);
+      acc[normalizedGroupId].totalCommission += Number(row.total_commission || 0);
+      acc[normalizedGroupId].totalProfit += Number(row.total_profit || 0);
+      acc[normalizedGroupId].totalVolume += Number(row.total_lots || 0);
+      acc[normalizedGroupId].totalTrades += Number(row.trade_count || 0);
+      
       return acc;
     }, {});
 
+    // Add current account profits (from MT5 API) to totals
+    Object.keys(accountToGroup).forEach(accountId => {
+      const groupId = accountToGroup[accountId];
+      const accountProfit = accountProfits[accountId] || 0;
+      if (groupId) {
+        const normalizedGroupId = String(groupId).toLowerCase();
+        if (!totals[normalizedGroupId]) {
+          totals[normalizedGroupId] = { totalLots: 0, totalCommission: 0, totalProfit: 0, totalVolume: 0, totalTrades: 0 };
+        }
+        totals[normalizedGroupId].totalProfit += accountProfit;
+      }
+    });
+
+    console.log(`[computeGroupAggregates] IB ${ibId} - Aggregates:`, JSON.stringify(totals, null, 2));
     return totals;
   } catch (e) {
     console.warn('computeGroupAggregates error:', e.message);
@@ -937,7 +1681,7 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
     const to = new Date().toISOString();
     // Fetch a wider window to ensure we capture existing trades
     const from = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-    const apiUrl = `http://18.175.242.21:5003/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+    const apiUrl = `http://18.175.242.21:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
 
     const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
     if (!response.ok) {
@@ -1123,6 +1867,20 @@ async function getTradingAccounts(ibId) {
               const apiData = await response.json();
               if (apiData.Success && apiData.Data) {
                 const data = apiData.Data;
+                
+                // Check if account is demo
+                const accountType = data.AccountType ?? data.accountType ?? data.AccountTypeText ?? data.accountTypeText ?? null;
+                const groupIdFull = data.Group || data.group || '';
+                const isDemo = 
+                  (accountType && String(accountType).toLowerCase().includes('demo')) ||
+                  (groupIdFull && String(groupIdFull).toLowerCase().includes('demo'));
+                
+                // Skip demo accounts
+                if (isDemo) {
+                  tradingAccounts[index] = null; // Mark for removal
+                  return;
+                }
+                
                 let groupName = data.Group || 'Unknown';
                 const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
                 if (match && match[1]) {
@@ -1139,19 +1897,29 @@ async function getTradingAccounts(ibId) {
                   group: groupName,
                   leverage: data.Leverage || row.leverage || 1000,
                   currency: 'USD',
-                  status: data.IsEnabled ? 1 : 0
+                  status: data.IsEnabled ? 1 : 0,
+                  isDemo: false
                 };
               }
             }
           } catch {}
         });
         await Promise.allSettled(fetchPromises);
+        
+        // Filter out demo accounts (null entries)
+        const filteredAccounts = tradingAccounts.filter(acc => acc !== null);
+        // Replace the array with filtered accounts
+        tradingAccounts.length = 0;
+        tradingAccounts.push(...filteredAccounts);
       } catch {}
     })();
 
-    console.log(`[Trading Accounts] Returning ${tradingAccounts.length} accounts`);
+    // Filter out any null entries (demo accounts) before returning
+    const filteredAccounts = tradingAccounts.filter(acc => acc !== null && !acc.isDemo);
+    
+    console.log(`[Trading Accounts] Returning ${filteredAccounts.length} real accounts (filtered out demo)`);
 
-    return tradingAccounts;
+    return filteredAccounts;
   } catch (error) {
     console.error('Error in getTradingAccounts:', error);
     return [];
@@ -1160,10 +1928,10 @@ async function getTradingAccounts(ibId) {
 
 async function getTradeHistory(ibId) {
   try {
-    // Get recent trades from ib_trade_history
+    // Get recent trades from ib_trade_history (only closed deals)
     const tradesResult = await query(`
       SELECT * FROM ib_trade_history
-      WHERE ib_request_id = $1
+      WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
       ORDER BY synced_at DESC
       LIMIT 100
     `, [ibId]);
@@ -1188,12 +1956,133 @@ async function getTradeHistory(ibId) {
   }
 }
 
-async function getTreeStructure() {
-  return {
-    ownLots: 0,
-    teamLots: 0,
-    totalTrades: 0
-  };
+// Build IB hierarchy tree using referral relationships
+async function getTreeStructure(rootIbId) {
+  try {
+    // Helper: compute own lots and trade count for a given IB (closed deals with P&L)
+    const getOwnStats = async (ibId) => {
+      const res = await query(
+        `SELECT COALESCE(SUM(volume_lots),0) as own_lots, COUNT(*)::int as trade_count
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+        [ibId]
+      );
+      const row = res.rows[0] || {};
+      return { ownLots: Number(row.own_lots || 0), tradeCount: Number(row.trade_count || 0) };
+    };
+
+    // Helper: fetch IB request basic info
+    const getIb = async (ibId) => {
+      const res = await query(
+        'SELECT id, full_name, email, status FROM ib_requests WHERE id = $1',
+        [ibId]
+      );
+      return res.rows[0] || null;
+    };
+
+    // Helper: get commission structures assigned to IB
+    const getAssignments = async (ibId) => {
+      const res = await query(
+        `SELECT structure_name, usd_per_lot, spread_share_percentage
+         FROM ib_group_assignments
+         WHERE ib_request_id = $1 AND (structure_name IS NOT NULL OR structure_id IS NOT NULL)`,
+        [ibId]
+      );
+      return res.rows.map(r => ({
+        structureName: r.structure_name || null,
+        usdPerLot: Number(r.usd_per_lot || 0),
+        spreadSharePercentage: Number(r.spread_share_percentage || 0)
+      }));
+    };
+
+    // Helper: total IB commission for this IB
+    const getIbCommissionTotal = async (ibId) => {
+      const res = await query(
+        `SELECT COALESCE(SUM(ib_commission),0) as total_ib_commission
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+        [ibId]
+      );
+      return Number(res.rows[0]?.total_ib_commission || 0);
+    };
+
+    // Helper: accounts count for IB user
+    const getAccountsCount = async (email) => {
+      const u = await query('SELECT id FROM "User" WHERE email = $1', [email]);
+      if (!u.rows.length) return 0;
+      const userId = u.rows[0].id;
+      const a = await query('SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1', [userId]);
+      return Number(a.rows[0]?.cnt || 0);
+    };
+
+    // Helper: fetch direct children (referred IBs)
+    const getChildren = async (ibId) => {
+      const res = await query(
+        `SELECT id, full_name, email, status
+         FROM ib_requests
+         WHERE referred_by = $1
+         ORDER BY approved_at NULLS LAST, submitted_at ASC`,
+        [ibId]
+      );
+      return res.rows;
+    };
+
+    // Build node recursively
+    const buildNode = async (ibId) => {
+      const ib = await getIb(ibId);
+      if (!ib) return null;
+      const { ownLots, tradeCount } = await getOwnStats(ibId);
+      const assignments = await getAssignments(ibId);
+      const ibCommissionTotal = await getIbCommissionTotal(ibId);
+      const accountsCount = await getAccountsCount(ib.email);
+      const childrenRecords = await getChildren(ibId);
+      const children = [];
+      let teamLots = 0;
+      for (const child of childrenRecords) {
+        const childNode = await buildNode(child.id);
+        if (childNode) {
+          children.push(childNode);
+          teamLots += childNode.ownLots + (childNode.teamLots || 0);
+        }
+      }
+      return {
+        id: ib.id,
+        name: ib.full_name,
+        email: ib.email,
+        status: ib.status,
+        ownLots,
+        tradeCount,
+        accountsCount,
+        ibCommissionTotal,
+        structures: assignments,
+        teamLots,
+        children
+      };
+    };
+
+    const root = await buildNode(rootIbId);
+    if (!root) {
+      return { ownLots: 0, teamLots: 0, totalTrades: 0, root: null };
+    }
+
+    // Aggregate overall metrics from the built tree
+    const totalTrades = (function countTrades(node) {
+      if (!node) return 0;
+      let total = Number(node.tradeCount || 0);
+      for (const c of node.children || []) total += countTrades(c);
+      return total;
+    })(root);
+
+    return {
+      ownLots: Number(root.ownLots || 0),
+      teamLots: Number(root.teamLots || 0),
+      totalTrades,
+      root
+    };
+  } catch (e) {
+    console.warn('getTreeStructure error:', e.message);
+    return { ownLots: 0, teamLots: 0, totalTrades: 0, root: null };
+  }
 }
 
 // Helper function to get IB groups and commission data (legacy mock)

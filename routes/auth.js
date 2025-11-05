@@ -138,10 +138,25 @@ router.post('/apply-partner', applyPartnerValidation, async (req, res) => {
       });
     }
 
-    const { fullName, email, password, ibType } = req.body;
+    const { fullName, email, password, ibType, referralCode } = req.body;
     const trimmedFullName = fullName.trim();
     const sanitizedFullName = trimmedFullName.replace(/[\r\n<>]/g, ' ').replace(/\s{2,}/g, ' ').trim();
     const normalizedType = (ibType || 'normal').toLowerCase();
+
+    // Look up referred_by IB ID if referral code is provided
+    let referredBy = null;
+    if (referralCode && typeof referralCode === 'string' && referralCode.trim()) {
+      const referrerIB = await IBRequest.findByReferralCode(referralCode.trim());
+      if (referrerIB) {
+        referredBy = referrerIB.id;
+      } else {
+        // Invalid referral code - return error
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid referral code. Please check and try again.'
+        });
+      }
+    }
 
     const existingUser = await User.findByEmail(email);
     if (!existingUser) {
@@ -186,11 +201,19 @@ router.post('/apply-partner', applyPartnerValidation, async (req, res) => {
         });
       }
 
-      const updatedRequest = await IBRequest.updateApplication(existingRequest.id, {
+      // Update referred_by if referral code was provided and not already set
+      const updateData = {
         fullName: sanitizedFullName,
         password,
         ibType: normalizedType
-      });
+      };
+      
+      // Only update referred_by if it's not already set
+      if (referredBy && !existingRequest.referred_by) {
+        updateData.referredBy = referredBy;
+      }
+
+      const updatedRequest = await IBRequest.updateApplication(existingRequest.id, updateData);
 
       return res.status(200).json({
         success: true,
@@ -205,7 +228,8 @@ router.post('/apply-partner', applyPartnerValidation, async (req, res) => {
       fullName: sanitizedFullName,
       email,
       password,
-      ibType: normalizedType
+      ibType: normalizedType,
+      referredBy
     });
 
     res.status(201).json({
@@ -217,6 +241,46 @@ router.post('/apply-partner', applyPartnerValidation, async (req, res) => {
     });
   } catch (error) {
     console.error('Apply partner error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Get referrer info by referral code (public endpoint)
+router.get('/referrer-info', async (req, res) => {
+  try {
+    const { referralCode } = req.query;
+
+    if (!referralCode || typeof referralCode !== 'string') {
+      return res.status(400).json({
+        success: false,
+        message: 'Referral code is required'
+      });
+    }
+
+    const referrer = await IBRequest.findByReferralCode(referralCode.trim());
+
+    if (!referrer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Invalid referral code'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        referrer: {
+          id: referrer.id,
+          fullName: referrer.full_name,
+          referralCode: referrer.referral_code
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Referrer info error:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error'

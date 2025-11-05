@@ -32,7 +32,7 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
     const userId = accountResult.rows[0].userId;
     
     // Fetch trades from MT5 API
-    const apiUrl = `${MT5_API_BASE}/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+    const apiUrl = `${MT5_API_BASE}/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
     console.log('Fetching trades from:', apiUrl);
     
     const response = await fetch(apiUrl, {
@@ -120,7 +120,7 @@ router.post('/sync-user/:ibRequestId', authenticateAdminToken, async (req, res) 
         const to = toDate || new Date().toISOString();
         const from = fromDate || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
         
-        const apiUrl = `${MT5_API_BASE}/api/client/ClientTradeHistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+        const apiUrl = `${MT5_API_BASE}/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
         const response = await fetch(apiUrl, { headers: { 'accept': '*/*' } });
         
         if (response.ok) {
