@@ -37,6 +37,7 @@ import userClientsRoutes from './routes/userClients.js';
 import userSymbolsRoutes from './routes/userSymbols.js';
 import userProfileRoutes from './routes/userProfile.js';
 import userPaymentsRoutes from './routes/userPayments.js';
+import userDashboardRoutes from './routes/userDashboard.js';
 
 
 dotenv.config();
@@ -127,6 +128,7 @@ app.use('/api/user/clients', userClientsRoutes);
 app.use('/api/user/symbols', userSymbolsRoutes);
 app.use('/api/user', userProfileRoutes);
 app.use('/api/user', userPaymentsRoutes);
+app.use('/api/user/dashboard', userDashboardRoutes);
 
 
 // Health check endpoint

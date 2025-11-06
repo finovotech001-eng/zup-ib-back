@@ -1719,13 +1719,14 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
       }
     } catch {}
 
-    await IBTradeHistory.upsertTrades(trades, {
+  await IBTradeHistory.upsertTrades(trades, {
       accountId,
       ibRequestId: ibId,
       userId,
       commissionMap,
       groupId
     });
+    try { await IBTradeHistory.calculateIBCommissions(accountId, ibId); } catch {}
     return true;
   } catch (error) {
     console.error(`Trade sync failed for account ${accountId}:`, error.message);

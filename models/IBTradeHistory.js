@@ -311,29 +311,24 @@ export class IBTradeHistory {
 
   static async calculateIBCommissions(accountId, ibRequestId) {
     try {
-      // Get IB commission rates
-      const ibResult = await query(
-        'SELECT usd_per_lot, spread_percentage_per_lot FROM ib_requests WHERE id = $1',
-        [ibRequestId]
-      );
-      
-      if (ibResult.rows.length === 0) {
-        return 0;
-      }
-      
-      const { usd_per_lot } = ibResult.rows[0];
-      const usdPerLot = Number(usd_per_lot || 0);
-      
-      // Calculate IB commission: (Volume in lots × USD per lot) - only for closed deals
+      // Calculate commission per trade using the assigned group's USD/lot when available
       const updateQuery = `
-        UPDATE ib_trade_history
-        SET ib_commission = (volume_lots * $1::numeric),
-        updated_at = CURRENT_TIMESTAMP
-        WHERE account_id = $2 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
-        RETURNING *;
+        UPDATE ib_trade_history AS t
+        SET ib_commission = (t.volume_lots * COALESCE(a.usd_per_lot, 0)),
+            updated_at = CURRENT_TIMESTAMP
+        FROM ib_group_assignments AS a
+        WHERE t.account_id = $1
+          AND t.ib_request_id = $2
+          AND t.close_price IS NOT NULL AND t.close_price != 0
+          AND (
+            lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_id, '')) OR
+            lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_name, '')) OR
+            regexp_replace(lower(COALESCE(t.group_id,'')), '.*[\\\\/]', '') = regexp_replace(lower(COALESCE(a.group_id,'')), '.*[\\\\/]', '')
+          )
+          AND a.ib_request_id = $2
+        RETURNING t.*;
       `;
-      
-      const result = await query(updateQuery, [usdPerLot, String(accountId)]);
+      const result = await query(updateQuery, [String(accountId), ibRequestId]);
       return result.rows.length;
     } catch (error) {
       console.error('Error calculating IB commissions:', error);
