@@ -130,4 +130,21 @@ export class IBWithdrawal {
     );
     return res.rows;
   }
+
+  static async listByStatus(ibRequestId, status = null, limit = 100) {
+    const params = [ibRequestId];
+    let where = 'ib_request_id = $1';
+    if (status) {
+      params.push(String(status).toLowerCase());
+      where += ` AND LOWER(status) = $${params.length}`;
+    }
+    const res = await query(
+      `SELECT * FROM ib_withdrawal_requests
+       WHERE ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length + 1}`,
+      [...params, Number(limit)]
+    );
+    return res.rows;
+  }
 }

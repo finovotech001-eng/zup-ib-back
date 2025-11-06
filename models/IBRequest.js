@@ -146,13 +146,9 @@ export class IBRequest {
             AND constraint_name = 'ib_requests_type_check'
             AND table_name = 'ib_requests'
         ) THEN
-          ALTER TABLE ib_requests
-            ADD CONSTRAINT ib_requests_type_check
-            -- Removed CHECK constraint to allow commission structure names (e.g., "Gold, Classic")
-            -- CHECK (ib_type IN (${allowedIbTypesList}));
+          NULL;
         END IF;
-      END
-      $$;
+      END$$;
     `);
 
 

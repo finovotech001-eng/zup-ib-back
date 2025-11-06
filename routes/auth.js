@@ -6,6 +6,9 @@ import { User } from '../models/User.js';
 
 const router = express.Router();
 
+const isDev = process.env.NODE_ENV !== 'production';
+const getJwtSecret = () => process.env.JWT_SECRET || (isDev ? 'dev-secret' : undefined);
+
 const generateToken = (request) => {
   return jwt.sign(
     {
@@ -13,7 +16,7 @@ const generateToken = (request) => {
       email: request.email,
       role: 'ib_partner'
     },
-    process.env.JWT_SECRET,
+    getJwtSecret(),
     { expiresIn: process.env.JWT_EXPIRE || '12h' }
   );
 };
@@ -326,7 +329,7 @@ export async function authenticateToken(req, res, next) {
       });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, getJwtSecret());
     const request = await IBRequest.findById(decoded.id);
 
     if (!request || request.status !== 'approved') {

@@ -297,6 +297,7 @@ async function start() {
       console.log(`IB Portal Server is running on port ${PORT}`);
       console.log(`Socket.IO server is ready`);
       console.log(`Environment: ${process.env.NODE_ENV}`);
+      console.log(`JWT secret configured: ${process.env.JWT_SECRET ? 'yes' : (process.env.NODE_ENV !== 'production' ? 'dev-fallback' : 'no')}`);
       
       // Start auto-sync job (every 5 minutes)
       console.log('[Auto-Sync] Scheduling auto-sync job every 5 minutes');

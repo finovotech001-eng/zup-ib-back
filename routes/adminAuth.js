@@ -15,8 +15,36 @@ const loginValidation = [
     .matches(/^[\S]+$/).withMessage('Password must not contain spaces')
 ];
 
+// Helper to get the primary JWT secret and dev fallback (non-production only)
+const getJwtSecrets = () => {
+  const secrets = [];
+  if (process.env.JWT_SECRET) secrets.push(process.env.JWT_SECRET);
+  if (process.env.NODE_ENV !== 'production') secrets.push('dev-secret');
+  return secrets;
+};
+
+const getPrimaryJwtSecret = () => {
+  const secrets = getJwtSecrets();
+  // Always sign with the first available secret
+  return secrets[0];
+};
+
+const verifyWithAnySecret = (token) => {
+  const secrets = getJwtSecrets();
+  let lastError;
+  for (const s of secrets) {
+    try {
+      if (!s) continue;
+      return jwt.verify(token, s);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('JWT verification failed');
+};
+
 const generateAdminToken = (admin) => {
-  const secret = process.env.JWT_SECRET || (process.env.NODE_ENV !== 'production' ? 'dev-secret' : undefined);
+  const secret = getPrimaryJwtSecret();
   return jwt.sign(
     {
       id: admin.id,
@@ -59,7 +87,7 @@ const authenticateAdminToken = async (req, res, next) => {
       });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || (process.env.NODE_ENV !== 'production' ? 'dev-secret' : undefined));
+    const decoded = verifyWithAnySecret(token);
 
     // Allow dev fallback admin token without DB lookup
     if (devFallbackEnabled && decoded?.role === 'admin' && decoded?.id === 'dev-admin') {
