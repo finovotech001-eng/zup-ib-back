@@ -314,21 +314,47 @@ export class IBTradeHistory {
       // Calculate commission per trade using the assigned group's USD/lot when available
       const updateQuery = `
         UPDATE ib_trade_history AS t
-        SET ib_commission = (t.volume_lots * COALESCE(a.usd_per_lot, 0)),
+        SET ib_commission = (t.volume_lots * COALESCE(a.usd_per_lot, s.usd_per_lot, 0)),
             updated_at = CURRENT_TIMESTAMP
         FROM ib_group_assignments AS a
+        LEFT JOIN group_commission_structures AS s ON (
+              s.id = a.structure_id
+           OR lower(COALESCE(s.structure_name, '')) = lower(COALESCE(a.structure_name, ''))
+        )
         WHERE t.account_id = $1
           AND t.ib_request_id = $2
           AND t.close_price IS NOT NULL AND t.close_price != 0
+          AND a.ib_request_id = $2
           AND (
             lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_id, '')) OR
             lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_name, '')) OR
             regexp_replace(lower(COALESCE(t.group_id,'')), '.*[\\\\/]', '') = regexp_replace(lower(COALESCE(a.group_id,'')), '.*[\\\\/]', '')
           )
-          AND a.ib_request_id = $2
         RETURNING t.*;
       `;
       const result = await query(updateQuery, [String(accountId), ibRequestId]);
+
+      // Fallback: if some rows still have 0 commission (no group match), use the
+      // highest configured USD/lot for this IB as a default to avoid zeros.
+      const fallbackRateRes = await query(
+        `SELECT COALESCE(MAX(COALESCE(a.usd_per_lot, s.usd_per_lot)), 0) AS usd_per_lot
+         FROM ib_group_assignments a
+         LEFT JOIN group_commission_structures s ON (s.id = a.structure_id OR lower(COALESCE(s.structure_name,'')) = lower(COALESCE(a.structure_name,'')))
+         WHERE a.ib_request_id = $1`,
+        [ibRequestId]
+      );
+      const fallbackUsdPerLot = Number(fallbackRateRes.rows?.[0]?.usd_per_lot || 0);
+      if (fallbackUsdPerLot > 0) {
+        await query(
+          `UPDATE ib_trade_history
+           SET ib_commission = (volume_lots * $1::numeric), updated_at = CURRENT_TIMESTAMP
+           WHERE ib_request_id = $2 AND account_id = $3
+             AND close_price IS NOT NULL AND close_price != 0
+             AND COALESCE(ib_commission,0) = 0`,
+          [fallbackUsdPerLot, ibRequestId, String(accountId)]
+        );
+      }
+
       return result.rows.length;
     } catch (error) {
       console.error('Error calculating IB commissions:', error);

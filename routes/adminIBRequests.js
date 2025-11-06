@@ -1364,7 +1364,42 @@ router.get('/profiles/:id/trades', authenticateAdminToken, async (req, res) => {
     const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
     const { groupId } = req.query;
-    const result = await IBTradeHistory.getTrades({ userId, accountId, groupId, limit, offset });
+    let result = await IBTradeHistory.getTrades({ userId, accountId, groupId, limit, offset });
+
+    // If some rows still have zero fixed commission, compute on the fly using
+    // the approved group's USD/lot so the UI always shows correct amounts.
+    try {
+      const assignments = await query(
+        `SELECT a.group_id, a.group_name,
+                COALESCE(a.usd_per_lot, s.usd_per_lot) AS usd_per_lot,
+                COALESCE(a.spread_share_percentage, s.spread_share_percentage) AS spread_share_percentage
+         FROM ib_group_assignments a
+         LEFT JOIN group_commission_structures s
+           ON (s.id = a.structure_id OR lower(COALESCE(s.structure_name,'')) = lower(COALESCE(a.structure_name,'')))
+         WHERE a.ib_request_id = $1`,
+        [id]
+      );
+      const norm = (gid) => {
+        if (!gid) return '';
+        const s = String(gid).toLowerCase();
+        const parts = s.split(/[\\/]/);
+        return parts[parts.length - 1] || s;
+      };
+      const rateMap = new Map();
+      for (const r of assignments.rows) {
+        const keys = [String(r.group_id||'').toLowerCase(), String(r.group_name||'').toLowerCase(), norm(r.group_id)];
+        for (const k of keys) { if (k) rateMap.set(k, Number(r.usd_per_lot || 0)); }
+      }
+      const fallbackRate = Math.max(0, ...assignments.rows.map(r => Number(r.usd_per_lot || 0)));
+      result.trades = result.trades.map(t => {
+        if (Number(t.ib_commission || 0) > 0) return t;
+        const k = norm(t.group_id) || String(t.group_id||'').toLowerCase();
+        const usdPerLot = rateMap.get(k) ?? fallbackRate;
+        const lots = Number(t.volume_lots || 0);
+        return { ...t, ib_commission: lots * usdPerLot };
+      });
+    } catch {}
+
     res.json({ success: true, data: result });
   } catch (error) {
     console.error('Fetch trade history error:', error);
