@@ -68,7 +68,8 @@ async function getApprovedUsdtAddressesForUser(userEmail) {
 router.get('/withdrawals/summary', authenticateToken, async (req, res) => {
   try {
     const ibId = req.user.id;
-    const summary = await IBWithdrawal.getSummary(ibId);
+    const period = Math.max(parseInt(req.query.period || '30', 10), 1);
+    const summary = await IBWithdrawal.getSummary(ibId, { periodDays: period });
     const recent = await IBWithdrawal.list(ibId, 10);
     const usdtAddresses = await getApprovedUsdtAddressesForUser(req.user.email);
     res.json({ success: true, data: { summary, recent, usdtAddresses } });

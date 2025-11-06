@@ -31,7 +31,8 @@ export class IBWithdrawal {
     return res.rows[0];
   }
 
-  static async getSummary(ibRequestId) {
+  static async getSummary(ibRequestId, opts = {}) {
+    const periodDays = Number(opts.periodDays || 0);
     // Compute earnings only from approved groups and include spread share
     try {
       // Fetch group assignments (approved groups for this IB)
@@ -61,10 +62,13 @@ export class IBWithdrawal {
 
       if (Object.keys(approvedMap).length) {
         // Aggregate trades by group id
+        // Optional time window for earnings (e.g., last 30 days)
+        const hasWindow = Number.isFinite(periodDays) && periodDays > 0;
+        const whereWindow = hasWindow ? ` AND (synced_at >= NOW() - INTERVAL '${periodDays} days')` : '';
         const tradesRes = await query(
           `SELECT group_id, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(ib_commission),0) AS fixed
            FROM ib_trade_history 
-           WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+           WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0${whereWindow}
            GROUP BY group_id`,
           [ibRequestId]
         );

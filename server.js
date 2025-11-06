@@ -44,6 +44,34 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// CORS configuration (allow local dev + env configured)
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  process.env.FRONTEND_ORIGIN
+].filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow non-browser requests (no origin) and all known dev origins
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    // In non-production, be permissive
+    if (process.env.NODE_ENV !== 'production') return callback(null, true);
+    return callback(new Error('CORS not allowed for this origin'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+// Register CORS early and handle preflight
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
 // Security middleware
 app.use(helmet());
 
@@ -54,12 +82,6 @@ const limiter = rateLimit({
   message: 'Too many requests from this IP, please try again later.'
 });
 app.use(limiter);
-
-// CORS configuration
-app.use(cors({
-  origin: '*',
-  credentials: false
-}));
 
 // Cookie parser middleware
 app.use(cookieParser());
