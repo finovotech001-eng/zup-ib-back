@@ -61,6 +61,22 @@ export class IBWithdrawal {
       let spread = 0;
 
       if (Object.keys(approvedMap).length) {
+        // Resolve allowed real account IDs for this IB (from MT5Account)
+        let allowed = [];
+        try {
+          const u = await query('SELECT id FROM "User" WHERE email = (SELECT email FROM ib_requests WHERE id = $1)', [ibRequestId]);
+          if (u.rows.length) {
+            const userId = u.rows[0].id;
+            const acc = await query(
+              `SELECT "accountId" FROM "MT5Account" 
+               WHERE "userId" = $1 
+                 AND (LOWER("accountType") IN ('live','real') OR LOWER(COALESCE("accountType", 'live')) IN ('live','real'))
+                 AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+              [userId]
+            );
+            allowed = acc.rows.map(r => String(r.accountId));
+          }
+        } catch {}
         // Aggregate trades by group id
         // Optional time window for earnings (e.g., last 30 days)
         const hasWindow = Number.isFinite(periodDays) && periodDays > 0;
@@ -68,9 +84,12 @@ export class IBWithdrawal {
         const tradesRes = await query(
           `SELECT group_id, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(ib_commission),0) AS fixed
            FROM ib_trade_history 
-           WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0${whereWindow}
+           WHERE ib_request_id = $1 
+             AND close_price IS NOT NULL AND close_price != 0 AND profit != 0${whereWindow}
+             AND (group_id IS NULL OR LOWER(group_id) NOT LIKE '%demo%')
+             ${Array.isArray(allowed) && allowed.length ? 'AND account_id = ANY($2)' : ''}
            GROUP BY group_id`,
-          [ibRequestId]
+          Array.isArray(allowed) && allowed.length ? [ibRequestId, allowed] : [ibRequestId]
         );
         for (const row of tradesRes.rows) {
           const k = normalize(row.group_id);

@@ -31,6 +31,32 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
     
     const userId = accountResult.rows[0].userId;
     
+    // Get commission structure for this IB
+    const assignmentsRes = await query(
+      'SELECT group_id, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
+      [ibRequestId]
+    );
+    
+    const commissionMap = assignmentsRes.rows.reduce((map, row) => {
+      if (!row.group_id) return map;
+      map[row.group_id.toLowerCase()] = {
+        usdPerLot: Number(row.usd_per_lot || 0),
+        spreadPercentage: Number(row.spread_share_percentage || 0)
+      };
+      return map;
+    }, {});
+    
+    // Fallback to default IB rates if no group assignments
+    if (!Object.keys(commissionMap).length) {
+      const ibRes = await query('SELECT usd_per_lot, spread_percentage_per_lot FROM ib_requests WHERE id = $1', [ibRequestId]);
+      if (ibRes.rows.length > 0) {
+        commissionMap['*'] = {
+          usdPerLot: Number(ibRes.rows[0].usd_per_lot || 0),
+          spreadPercentage: Number(ibRes.rows[0].spread_percentage_per_lot || 0)
+        };
+      }
+    }
+    
     // Fetch trades from MT5 API
     const apiUrl = `${MT5_API_BASE}/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
     console.log('Fetching trades from:', apiUrl);
@@ -56,11 +82,8 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
       }
     } catch {}
 
-    // Save trades to database
-    const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, groupId });
-    
-    // Calculate IB commissions
-    await IBTradeHistory.calculateIBCommissions(accountId, ibRequestId);
+    // Save trades to database with commission map
+    const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap, groupId });
     
     res.json({
       success: true,
@@ -103,6 +126,32 @@ router.post('/sync-user/:ibRequestId', authenticateAdminToken, async (req, res) 
     
     const userId = userResult.rows[0].id;
     
+    // Get commission structure for this IB
+    const assignmentsRes = await query(
+      'SELECT group_id, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
+      [ibRequestId]
+    );
+    
+    const commissionMap = assignmentsRes.rows.reduce((map, row) => {
+      if (!row.group_id) return map;
+      map[row.group_id.toLowerCase()] = {
+        usdPerLot: Number(row.usd_per_lot || 0),
+        spreadPercentage: Number(row.spread_share_percentage || 0)
+      };
+      return map;
+    }, {});
+    
+    // Fallback to default IB rates if no group assignments
+    if (!Object.keys(commissionMap).length) {
+      const ibRes = await query('SELECT usd_per_lot, spread_percentage_per_lot FROM ib_requests WHERE id = $1', [ibRequestId]);
+      if (ibRes.rows.length > 0) {
+        commissionMap['*'] = {
+          usdPerLot: Number(ibRes.rows[0].usd_per_lot || 0),
+          spreadPercentage: Number(ibRes.rows[0].spread_percentage_per_lot || 0)
+        };
+      }
+    }
+    
     // Get all MT5 accounts for this user
     const accountsResult = await query(
       'SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1',
@@ -135,10 +184,7 @@ router.post('/sync-user/:ibRequestId', authenticateAdminToken, async (req, res) 
               groupId = (prof?.Data || prof?.data)?.Group || null;
             }
           } catch {}
-          const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, groupId });
-          
-          // Calculate IB commissions
-          await IBTradeHistory.calculateIBCommissions(accountId, ibRequestId);
+          const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap, groupId });
           
           totalSynced += savedTrades.length;
           results.push({

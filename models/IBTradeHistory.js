@@ -73,7 +73,14 @@ export class IBTradeHistory {
   // Upsert trades with optional IB commission calculation
   static async upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap = {}, groupId = null }) {
     const saved = [];
-    const usdPerLot = Number(commissionMap['*']?.usdPerLot || 0);
+    
+    // Get commission rate from map based on group or fallback to default
+    let usdPerLot = 0;
+    if (groupId && commissionMap[groupId.toLowerCase()]) {
+      usdPerLot = Number(commissionMap[groupId.toLowerCase()]?.usdPerLot || 0);
+    } else if (commissionMap['*']) {
+      usdPerLot = Number(commissionMap['*']?.usdPerLot || 0);
+    }
 
     for (const trade of trades) {
       try {
@@ -101,13 +108,13 @@ export class IBTradeHistory {
         const volume = Number(trade?.Volume || 0);
         if (!volume || volume === 0) continue;
         
-        // CRITICAL: Only include trades with non-zero profit (actual closed positions with P&L)
-        // Trades with $0.00 profit are opening legs or adjustments, not closed positions
+        // Allow zero-profit trades so history shows all closed deals
         const profit = Number(trade?.Profit || 0);
-        if (profit === 0) continue;
 
         const id = `${accountId}-${orderId}`;
-        const volumeLots = volume * 1000; // Convert to lots (MT5 Volume is in lots, multiply by 1000 for consistency)
+        // MT5 returns volume in different formats - convert to standard lots
+        // If volume < 0.1, it's likely in mini/micro lots, multiply by 1000
+        const volumeLots = volume < 0.1 ? volume * 1000 : volume;
         const ibCommission = volumeLots * usdPerLot;
 
         const queryText = `
@@ -160,7 +167,7 @@ export class IBTradeHistory {
   // Paginated trades for a user/account used by admin route
   static async getTrades({ userId, accountId = null, groupId = null, limit = 50, offset = 0 }) {
     const params = [userId];
-    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0';
+    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price != 0';
     if (accountId) {
       params.push(String(accountId));
       where += ` AND account_id = $${params.length}`;
@@ -259,6 +266,8 @@ export class IBTradeHistory {
         if (profit === 0) continue;
         
         const id = `${accountId}-${orderId}`;
+        // MT5 returns volume in different formats - convert to standard lots
+        const volumeLots = volume < 0.1 ? volume * 1000 : volume;
         
         const insertQuery = `
           INSERT INTO ib_trade_history (
@@ -283,7 +292,7 @@ export class IBTradeHistory {
           ibRequestId,
           symbol,
           orderType,
-          volume * 1000, // Convert to lots
+          volumeLots,
           openPrice,
           closePrice,
           profit,

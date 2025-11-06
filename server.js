@@ -276,7 +276,7 @@ async function autoSyncTrades() {
           const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
           try {
-            const apiUrl = `http://18.175.242.21:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+            const apiUrl = `http://18.130.5.209:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
             const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
 
             if (response.ok) {
@@ -284,7 +284,7 @@ async function autoSyncTrades() {
               const trades = data.Items || [];
               let groupId = null;
               try {
-                const profRes = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+                const profRes = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
                 if (profRes.ok) {
                   const prof = await profRes.json();
                   groupId = (prof?.Data || prof?.data)?.Group || null;

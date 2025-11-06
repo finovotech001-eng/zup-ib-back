@@ -1699,7 +1699,7 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
     const to = new Date().toISOString();
     // Fetch a wider window to ensure we capture existing trades
     const from = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-    const apiUrl = `http://18.175.242.21:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+    const apiUrl = `http://18.130.5.209:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
 
     const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
     if (!response.ok) {
@@ -1712,7 +1712,7 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
     // Resolve group id for this account
     let groupId = null;
     try {
-      const profRes = await fetch(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+      const profRes = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
       if (profRes.ok) {
         const prof = await profRes.json();
         groupId = (prof?.Data || prof?.data)?.Group || null;
@@ -1977,16 +1977,82 @@ async function getTradeHistory(ibId) {
 // Build IB hierarchy tree using referral relationships
 async function getTreeStructure(rootIbId) {
   try {
-    // Helper: compute own lots and trade count for a given IB (closed deals with P&L)
+    // Helper: list real account IDs for an IB (from MT5Account with accountType/package filters)
+    const getRealAccountIdsByIbId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        const email = ibRes.rows?.[0]?.email;
+        if (!email) return [];
+        const u = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [email]);
+        if (!u.rows.length) return [];
+        const userId = u.rows[0].id;
+        const attempts = [
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER("accountType") IN ('live','real') AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(accountType) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(account_type) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(type) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+          // accountType-only
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER("accountType") IN ('live','real')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(accountType) IN ('live','real')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(account_type) IN ('live','real')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND LOWER(type) IN ('live','real')`,
+          // package-only (not demo)
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+          `SELECT "accountId" AS id FROM "MT5Account" WHERE "userId" = $1 AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`
+        ];
+        for (const q of attempts) {
+          try {
+            const r = await query(q, [userId]);
+            if (r.rows?.length) return r.rows.map(x => String(x.id));
+          } catch {/* try next */}
+        }
+      } catch {}
+      return [];
+    };
+    // Helper: compute own lots and commission breakdown for a given IB
     const getOwnStats = async (ibId) => {
-      const res = await query(
-        `SELECT COALESCE(SUM(volume_lots),0) as own_lots, COUNT(*)::int as trade_count
-         FROM ib_trade_history
-         WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+      const allowed = await getRealAccountIdsByIbId(ibId);
+      // Fetch approved group mappings for this IB
+      const assignRes = await query(
+        `SELECT group_id, usd_per_lot, spread_share_percentage
+         FROM ib_group_assignments WHERE ib_request_id = $1`,
         [ibId]
       );
-      const row = res.rows[0] || {};
-      return { ownLots: Number(row.own_lots || 0), tradeCount: Number(row.trade_count || 0) };
+      const normalize = (gid) => {
+        if (!gid) return '';
+        const s = String(gid).toLowerCase().trim();
+        const parts = s.split(/[\\/]/);
+        return parts[parts.length - 1] || s;
+      };
+      const approved = new Map();
+      for (const r of assignRes.rows) {
+        const k = normalize(r.group_id);
+        if (k) approved.set(k, { usdPerLot: Number(r.usd_per_lot || 0), spreadPct: Number(r.spread_share_percentage || 0) });
+      }
+      if (!allowed.length || !approved.size) return { ownLots: 0, tradeCount: 0, fixed: 0, spread: 0 };
+
+      const res = await query(
+        `SELECT group_id, COALESCE(SUM(volume_lots),0) AS lots, COUNT(*)::int AS trade_count, COALESCE(SUM(ib_commission),0) AS fixed
+         FROM ib_trade_history
+         WHERE ib_request_id = $1
+           AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+           AND account_id = ANY($2)
+         GROUP BY group_id`,
+        [ibId, allowed]
+      );
+      let ownLots = 0, tradeCount = 0, fixed = 0, spread = 0;
+      for (const row of res.rows) {
+        const k = normalize(row.group_id);
+        const rule = approved.get(k);
+        if (!rule) continue; // only approved groups
+        const l = Number(row.lots || 0);
+        ownLots += l;
+        tradeCount += Number(row.trade_count || 0);
+        const f = Number(row.fixed || 0);
+        fixed += f;
+        spread += l * (Number(rule.spreadPct || 0) / 100);
+      }
+      return { ownLots, tradeCount, fixed, spread };
     };
 
     // Helper: fetch IB request basic info
@@ -1998,7 +2064,7 @@ async function getTreeStructure(rootIbId) {
       return res.rows[0] || null;
     };
 
-    // Helper: get commission structures assigned to IB
+    // Helper: get commission structures assigned to IB (for display)
     const getAssignments = async (ibId) => {
       const res = await query(
         `SELECT structure_name, usd_per_lot, spread_share_percentage
@@ -2013,24 +2079,58 @@ async function getTreeStructure(rootIbId) {
       }));
     };
 
-    // Helper: total IB commission for this IB
+    // Helper: total IB commission for this IB (fixed+spread)
     const getIbCommissionTotal = async (ibId) => {
-      const res = await query(
-        `SELECT COALESCE(SUM(ib_commission),0) as total_ib_commission
-         FROM ib_trade_history
-         WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
-        [ibId]
-      );
-      return Number(res.rows[0]?.total_ib_commission || 0);
+      const s = await getOwnStats(ibId);
+      return s.fixed + s.spread;
     };
 
     // Helper: accounts count for IB user
-    const getAccountsCount = async (email) => {
-      const u = await query('SELECT id FROM "User" WHERE email = $1', [email]);
-      if (!u.rows.length) return 0;
-      const userId = u.rows[0].id;
-      const a = await query('SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1', [userId]);
-      return Number(a.rows[0]?.cnt || 0);
+    const getAccountsCount = async (ibEmail) => {
+      // Prefer counting real accounts from MT5Account using accountType + package filters
+      try {
+        const u = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ibEmail]);
+        if (u.rows.length) {
+          const userId = u.rows[0].id;
+
+          // Try with both quoted/unquoted column variations
+          const attempts = [
+            // Both columns present, strict: accountType in ('live','real') AND package not demo
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER("accountType") IN ('live','real') AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(accountType) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(account_type) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(type) IN ('live','real') AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`,
+            // If package not present, at least ensure accountType is live/real
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER("accountType") IN ('live','real')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(accountType) IN ('live','real')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(account_type) IN ('live','real')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND LOWER(type) IN ('live','real')`,
+            // If accountType not present, fallback to package not demo
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+            `SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1 AND (package IS NULL OR LOWER(package) NOT LIKE '%demo%')`
+          ];
+
+          for (const q of attempts) {
+            try {
+              const r = await query(q, [userId]);
+              if (r?.rows?.[0]?.cnt !== undefined) return Number(r.rows[0].cnt || 0);
+            } catch {/* try next variant */}
+          }
+        }
+      } catch {/* fall back below */}
+
+      // Final fallback: count distinct real-account trades (non-demo groups)
+      try {
+        const r = await query(
+          `SELECT COUNT(DISTINCT account_id)::int AS cnt
+           FROM ib_trade_history
+           WHERE close_price IS NOT NULL AND close_price != 0 AND profit != 0
+             AND (group_id IS NULL OR LOWER(group_id) NOT LIKE '%demo%')
+             AND ib_request_id = (SELECT id FROM ib_requests WHERE LOWER(email)=LOWER($1) LIMIT 1)`,
+          [ibEmail]
+        );
+        return Number(r.rows?.[0]?.cnt || 0);
+      } catch { return 0; }
     };
 
     // Helper: fetch direct children (referred IBs)
@@ -2049,9 +2149,9 @@ async function getTreeStructure(rootIbId) {
     const buildNode = async (ibId) => {
       const ib = await getIb(ibId);
       if (!ib) return null;
-      const { ownLots, tradeCount } = await getOwnStats(ibId);
+      const { ownLots, tradeCount, fixed, spread } = await getOwnStats(ibId);
       const assignments = await getAssignments(ibId);
-      const ibCommissionTotal = await getIbCommissionTotal(ibId);
+      const ibCommissionTotal = fixed + spread;
       const accountsCount = await getAccountsCount(ib.email);
       const childrenRecords = await getChildren(ibId);
       const children = [];
@@ -2072,6 +2172,8 @@ async function getTreeStructure(rootIbId) {
         tradeCount,
         accountsCount,
         ibCommissionTotal,
+        fixedCommission: fixed,
+        spreadCommission: spread,
         structures: assignments,
         teamLots,
         children

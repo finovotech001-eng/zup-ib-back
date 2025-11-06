@@ -4,7 +4,7 @@ import { query } from '../config/database.js';
 
 const router = express.Router();
 
-const MT5_API_BASE = 'http://18.175.242.21:5003';
+const MT5_API_BASE = 'http://18.130.5.209:5003';
 
 // Helper: fetch MT5 client profile with small retry and timeout
 async function fetchMt5Profile(accountId) {
@@ -29,13 +29,25 @@ async function fetchMt5Profile(accountId) {
 router.get('/overview', authenticateToken, async (req, res) => {
   try {
     const ib = req.user; // from authenticateToken
-    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [ib.email]);
+    // Time window alignment with admin (default last 30 days)
+    const period = Math.max(parseInt(req.query.period || '30', 10), 1);
+    const hasWindow = Number.isFinite(period) && period > 0;
+    const windowSql = hasWindow ? ` AND (synced_at >= NOW() - INTERVAL '${period} days')` : '';
+    const userResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ib.email]);
     if (!userResult.rows.length) {
       return res.json({ success: true, data: { stats: { totalAccounts: 0, totalBalance: 0, totalEquity: 0, accountStatus: ib.status }, accounts: [], commissionInfo: { standard: `$${Number(ib.usd_per_lot || 0).toFixed(2)} per lot`, commissionType: 'Commission per lot' }, groups: [] } });
     }
 
     const userId = userResult.rows[0].id;
-    const accountsRes = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
+    // Real accounts only (accountType: live/real) and package not demo when present
+    const accountsRes = await query(
+      `SELECT "accountId", "accountType", "package" 
+       FROM "MT5Account" 
+       WHERE "userId" = $1 
+         AND (LOWER("accountType") IN ('live','real') OR LOWER(COALESCE("accountType", 'live')) IN ('live','real'))
+         AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
+      [userId]
+    );
 
     const accountsRaw = await Promise.all(
       accountsRes.rows.map(async (r) => {
@@ -45,18 +57,16 @@ router.get('/overview', authenticateToken, async (req, res) => {
         const margin = Number(payload?.Margin ?? payload?.margin ?? 0);
         const profit = Number(payload?.Profit ?? payload?.profit ?? 0);
         const groupFull = payload?.Group || payload?.group || '';
-        const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? '';
-        const isDemo = String(groupFull).toLowerCase().includes('demo') || String(accountType).toLowerCase().includes('demo');
         let groupName = groupFull;
         if (typeof groupName === 'string') {
           const parts = groupName.split(/[\\/]/);
           groupName = parts[parts.length - 1] || groupName;
         }
-        return { accountId: String(r.accountId), balance, equity, margin, profit, group: groupName, groupId: groupFull, isDemo };
+        return { accountId: String(r.accountId), balance, equity, margin, profit, group: groupName, groupId: groupFull, isDemo: false };
       })
     );
 
-    let accounts = accountsRaw.filter(a => !a.isDemo);
+    let accounts = accountsRaw;
     const totals = accounts.reduce((t, a) => ({ totalAccounts: (t.totalAccounts || 0) + 1, totalBalance: (t.totalBalance || 0) + a.balance, totalEquity: (t.totalEquity || 0) + a.equity }), { totalAccounts: 0, totalBalance: 0, totalEquity: 0 });
 
     // Group assignments with simple aggregates from ib_trade_history
@@ -65,40 +75,26 @@ router.get('/overview', authenticateToken, async (req, res) => {
        FROM ib_group_assignments WHERE ib_request_id = $1`,
       [ib.id]
     );
-    // Aggregates per account (for card display)
-    const tradesRes = await query(
-      `SELECT account_id, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(ib_commission),0) AS commission
-       FROM ib_trade_history WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
-       GROUP BY account_id`,
+    // Aggregates per account and per group (filter to approved groups + real accounts only)
+    const perAccGroupRes = await query(
+      `SELECT account_id, group_id, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(ib_commission),0) AS commission
+       FROM ib_trade_history 
+       WHERE ib_request_id = $1 
+         AND close_price IS NOT NULL AND close_price != 0 AND profit != 0 AND profit IS NOT NULL${windowSql}
+       GROUP BY account_id, group_id`,
       [ib.id]
     );
-    const accountToGroup = Object.fromEntries(accounts.map(a => [a.accountId, (a.groupId || '').toLowerCase()]));
-    const groupAgg = {};
-    for (const row of tradesRes.rows) {
-      const key = (accountToGroup[row.account_id] || '').toLowerCase();
-      if (!key) continue;
-      if (!groupAgg[key]) groupAgg[key] = { lots: 0, commission: 0 };
-      groupAgg[key].lots += Number(row.lots || 0);
-      groupAgg[key].commission += Number(row.commission || 0);
-    }
 
-    // Attach per-account totals (fixed + lots) and commission eligibility by group assignment
-    const perAccountMap = tradesRes.rows.reduce((m, r) => {
-      m[String(r.account_id)] = Number(r.commission || 0);
-      return m;
-    }, {});
-    const lotsByAccount = tradesRes.rows.reduce((m, r) => {
-      m[String(r.account_id)] = Number(r.lots || 0);
-      return m;
-    }, {});
-
-    // Build assignment map by normalized group id/name for quick lookup
+    // Build helper sets/maps for filtering
+    const realAccountIds = new Set(accounts.map(a => String(a.accountId)));
     const normalize = (gid) => {
       if (!gid) return '';
       const s = String(gid).toLowerCase().trim();
       const parts = s.split(/[\\/]/);
       return parts[parts.length - 1] || s;
     };
+
+    // Build assignment map BEFORE applying aggregates
     const assignmentMap = assignments.rows.reduce((m, r) => {
       const k = normalize(r.group_id);
       if (!k) return m;
@@ -108,6 +104,36 @@ router.get('/overview', authenticateToken, async (req, res) => {
       };
       return m;
     }, {});
+
+    // Aggregate rows for real accounts with approved groups only
+    const groupAgg = {}; // keyed by normalized group id
+    const perAccountMap = {}; // account -> fixed sum (approved groups only)
+    const lotsByAccount = {}; // account -> lots sum (approved groups only)
+    for (const row of perAccGroupRes.rows) {
+      const accId = String(row.account_id);
+      if (!realAccountIds.has(accId)) continue;
+      
+      // Skip demo groups
+      const groupIdLower = String(row.group_id || '').toLowerCase();
+      if (groupIdLower.includes('demo')) continue;
+      
+      const normGroup = normalize(row.group_id);
+      const hasAssignment = !!assignmentMap[normGroup];
+
+      // Only process if group has assignment (approved group)
+      if (!hasAssignment) continue;
+
+      // Sum by group for the Groups section
+      if (!groupAgg[normGroup]) groupAgg[normGroup] = { lots: 0, commission: 0 };
+      groupAgg[normGroup].lots += Number(row.lots || 0);
+      groupAgg[normGroup].commission += Number(row.commission || 0);
+
+      // Sum per account (only approved groups)
+      perAccountMap[accId] = (perAccountMap[accId] || 0) + Number(row.commission || 0);
+      lotsByAccount[accId] = (lotsByAccount[accId] || 0) + Number(row.lots || 0);
+    }
+
+    // assignmentMap already defined above
 
     accounts = accounts.map(a => {
       const key = normalize(a.groupId);
@@ -186,11 +212,16 @@ router.get('/overview', authenticateToken, async (req, res) => {
     // Build approved-groups summary for overview cards
     let summary = { totalTrades: 0, totalLots: 0, totalProfit: 0, fixedCommission: 0, spreadCommission: 0, totalCommission: 0 };
     try {
+      // Restrict to real account ids only
+      const allowedAccountIds = Array.from(realAccountIds);
       const grpRes = await query(
         `SELECT group_id, COUNT(*)::int AS trades, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(profit),0) AS profit, COALESCE(SUM(ib_commission),0) AS fixed
-         FROM ib_trade_history WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+         FROM ib_trade_history 
+         WHERE ib_request_id = $1 
+           AND close_price IS NOT NULL AND close_price != 0 AND profit != 0 AND profit IS NOT NULL${windowSql}
+           ${allowedAccountIds.length ? 'AND account_id = ANY($2)' : ''}
          GROUP BY group_id`,
-        [ib.id]
+        allowedAccountIds.length ? [ib.id, allowedAccountIds] : [ib.id]
       );
       // Build assignment map
       const normalize = (gid) => {
@@ -207,13 +238,20 @@ router.get('/overview', authenticateToken, async (req, res) => {
       }, {});
 
       for (const row of grpRes.rows) {
+        // Skip demo groups
+        const groupIdLower = String(row.group_id || '').toLowerCase();
+        if (groupIdLower.includes('demo')) continue;
+        
         const k = normalize(row.group_id);
-        if (!assignmentMap[k]) continue; // only approved groups
+        // Only approved groups
+        if (!assignmentMap[k]) continue;
         const lots = Number(row.lots || 0);
         const fixed = Number(row.fixed || 0);
         const profit = Number(row.profit || 0);
         const trades = Number(row.trades || 0);
+        
         const spread = lots * (assignmentMap[k].spreadPct / 100);
+        
         summary.totalTrades += trades;
         summary.totalLots += lots;
         summary.totalProfit += profit;
@@ -263,7 +301,7 @@ router.get('/commission-analytics', authenticateToken, async (req, res) => {
     const period = Math.max(parseInt(req.query.period || '30', 10), 1);
 
     // 1) Resolve this user's real MT5 accounts (exclude demos)
-    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [ib.email]);
+    const userResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ib.email]);
     const allowedAccounts = new Set();
     let hasRealAccounts = false;
     if (userResult.rows.length) {
