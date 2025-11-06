@@ -32,44 +32,48 @@ router.get('/', authenticateToken, async (req, res) => {
 
     const ibRequestId = ibResult.rows[0].id;
 
-    // Get clients linked to this IB
+    // Get clients referred by this IB (from ib_requests.referred_by)
     const clientsResult = await query(`
       SELECT 
-        icl.user_id,
-        icl.user_name,
-        icl.user_email,
-        icl.user_account_id,
-        icl.linked_at,
-        icl.direct_volume_lots,
-        icl.direct_commission,
+        ib.id as ib_id,
+        ib.full_name as user_name,
+        ib.email as user_email,
+        ib.submitted_at as linked_at,
+        ib.ib_type,
+        ib.status,
+        COALESCE(SUM(th.volume_lots), 0) as direct_volume_lots,
+        COALESCE(SUM(th.ib_commission), 0) as direct_commission,
         COUNT(DISTINCT ma."accountId") as account_count
-      FROM ib_client_linking icl
-      LEFT JOIN "User" u ON u.id = icl.user_id
-      LEFT JOIN "MT5Account" ma ON ma."userId" = icl.user_id
-      WHERE icl.assigned_ib_id = $1 AND icl.status = 'active'
-      GROUP BY icl.user_id, icl.user_name, icl.user_email, icl.user_account_id, icl.linked_at, icl.direct_volume_lots, icl.direct_commission
-      ORDER BY icl.linked_at DESC
+      FROM ib_requests ib
+      LEFT JOIN "User" u ON u.email = ib.email
+      LEFT JOIN "MT5Account" ma ON ma."userId" = u.id
+      LEFT JOIN ib_trade_history th ON th.ib_request_id = ib.id
+      WHERE ib.referred_by = $1
+      GROUP BY ib.id, ib.full_name, ib.email, ib.submitted_at, ib.ib_type, ib.status
+      ORDER BY ib.submitted_at DESC
     `, [ibRequestId]);
 
     const clients = clientsResult.rows.map(row => ({
-      userId: row.user_id,
+      userId: row.ib_id,
       name: row.user_name,
       email: row.user_email,
-      accountId: row.user_account_id,
+      accountId: '-',
       joinDate: row.linked_at,
       totalLots: Number(row.direct_volume_lots || 0),
       commission: Number(row.direct_commission || 0),
       accountCount: parseInt(row.account_count || 0),
-      lastTrade: null // Will be populated from trade history
+      ibType: row.ib_type,
+      status: row.status,
+      lastTrade: null
     }));
 
     // Get last trade date for each client
     for (const client of clients) {
       const lastTradeResult = await query(`
-        SELECT MAX(created_at) as last_trade
+        SELECT MAX(synced_at) as last_trade
         FROM ib_trade_history
-        WHERE user_id::text = $1 AND ib_request_id = $2
-      `, [String(client.userId), ibRequestId]);
+        WHERE ib_request_id = $1
+      `, [client.userId]);
 
       if (lastTradeResult.rows[0]?.last_trade) {
         client.lastTrade = lastTradeResult.rows[0].last_trade;
