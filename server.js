@@ -31,6 +31,7 @@ import mt5TradesRoutes from './routes/mt5Trades.js';
 import adminTradingGroupsRoutes from './routes/adminTradingGroups.js';
 import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
 import adminIBUpgradeRoutes from './routes/adminIBUpgrade.js';
+import adminWithdrawalsRoutes from './routes/adminWithdrawals.js';
 // User-facing routes
 import userClientsRoutes from './routes/userClients.js';
 import userSymbolsRoutes from './routes/userSymbols.js';
@@ -122,6 +123,7 @@ app.use('/api/admin/mt5-trades', mt5TradesRoutes);
 app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
 app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
 app.use('/api/admin/ib-upgrade', adminIBUpgradeRoutes);
+app.use('/api/admin/withdrawals', adminWithdrawalsRoutes);
 // Mount user-facing routes
 app.use('/api/user/clients', userClientsRoutes);
 app.use('/api/user/symbols', userSymbolsRoutes);

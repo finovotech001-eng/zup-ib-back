@@ -301,226 +301,315 @@ router.get('/overview', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/user/commission-analytics
+// GET /api/user/commission-analytics - Fetch from ib_trade_history table with pagination
 router.get('/commission-analytics', authenticateToken, async (req, res) => {
   try {
-    const ib = req.user; // has id and email
+    const ib = req.user;
     const ibId = ib.id;
     const period = Math.max(parseInt(req.query.period || '30', 10), 1);
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
+    const offset = (page - 1) * limit;
 
-    // Default window: from IB approved date → year 2085 (override via ?from=&to=)
-    let approvedAt = null;
-    try {
-      const r = await query('SELECT approved_at FROM ib_requests WHERE id = $1', [ibId]);
-      approvedAt = r.rows?.[0]?.approved_at || null;
-    } catch {}
-    const defaultFrom = approvedAt ? new Date(approvedAt).toISOString() : new Date('2000-01-01T00:00:00.000Z').toISOString();
-    const defaultTo = new Date('2085-01-01T00:00:00.000Z').toISOString();
-    const fromDate = String(req.query.from || defaultFrom);
-    const toDate = String(req.query.to || defaultTo);
-
-    // 1) Resolve this user's real MT5 accounts (exclude demos)
-    // Cache key covering IB + date window
-    const cacheKey = `${ibId}:${fromDate}:${toDate}`;
+    // Cache key: IB ID + period + page + limit (5 minute cache)
+    const cacheKey = `analytics:${ibId}:${period}:${page}:${limit}`;
     const cached = analyticsCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       return res.json({ success: true, data: cached.payload });
     }
 
-    const userResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ib.email]);
-    const allowedAccounts = new Set();
-    const accountToGroup = new Map();
-    if (userResult.rows.length) {
-      const userId = userResult.rows[0].id;
-      const accountsRes = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
-      const profiles = await Promise.all(accountsRes.rows.map(async r => ({ id: String(r.accountId), prof: await fetchMt5Profile(r.accountId) })));
-      for (const { id, prof } of profiles) {
-        const group = prof?.Group || prof?.group || '';
-        const accountType = prof?.AccountType ?? prof?.accountType ?? prof?.AccountTypeText ?? prof?.accountTypeText ?? '';
-        const isDemo = String(group).toLowerCase().includes('demo') || String(accountType).toLowerCase().includes('demo');
-        if (!isDemo) { allowedAccounts.add(id); accountToGroup.set(id, group || ''); }
-      }
-    }
+    // Calculate date range for period
+    const now = new Date();
+    const periodStart = new Date(now.getTime() - period * 24 * 60 * 60 * 1000);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-    // 2) Build approved group map from assignments
+    // Get approved group assignments for spread calculation
     const assignments = await query(
       `SELECT group_id, group_name, structure_name, usd_per_lot, spread_share_percentage
        FROM ib_group_assignments WHERE ib_request_id = $1`,
       [ibId]
     );
+
+    // Normalize group IDs for matching
     const normalize = (gid) => {
       if (!gid) return '';
       const s = String(gid).toLowerCase().trim();
       const parts = s.split(/[\\/]/);
       return parts[parts.length - 1] || s;
     };
-    const approvedMap = new Map();
+
+    // Build assignment map for spread calculation
+    const assignmentMap = new Map();
     for (const row of assignments.rows) {
-      const keys = new Set();
-      const gid = String(row.group_id || '').toLowerCase();
-      const gname = String(row.group_name || '').toLowerCase();
-      if (gid) keys.add(gid);
-      if (gname) keys.add(gname);
-      const shortKey = normalize(gid);
-      if (shortKey) keys.add(shortKey);
+      const keys = [
+        String(row.group_id || '').toLowerCase(),
+        String(row.group_name || '').toLowerCase(),
+        normalize(row.group_id)
+      ].filter(k => k);
       for (const k of keys) {
-        approvedMap.set(k, {
-          structureName: row.structure_name,
-          usdPerLot: Number(row.usd_per_lot || 0),
-          spreadSharePercentage: Number(row.spread_share_percentage || 0)
+        assignmentMap.set(k, {
+          spreadSharePercentage: Number(row.spread_share_percentage || 0),
+          usdPerLot: Number(row.usd_per_lot || 0)
         });
       }
     }
 
-    // 3) Fetch trades from MT5 API for allowed accounts within [fromDate, toDate]
-    const makeKeys = (gid) => {
-      if (!gid) return [];
-      const s = String(gid).trim().toLowerCase();
-      const fwd = s.replace(/\\\\/g, '/');
-      const bwd = s.replace(/\//g, '\\');
-      const parts = s.split(/[\\\\/]/);
-      const last = parts[parts.length - 1] || s;
-      const idx = parts.findIndex(p => p === 'bbook');
-      const keys = new Set([s, fwd, bwd, last]);
-      if (idx >= 0 && idx + 1 < parts.length) keys.add(parts[idx + 1]);
-      return Array.from(keys);
-    };
+    // Fetch total count for pagination
+    // Only show DEALS OUT: closed positions where profit exists (profit != 0)
+    // Deal IN has profit = 0, Deal OUT has profit != 0 (can be positive or negative)
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM ib_trade_history
+      WHERE ib_request_id = $1
+        AND close_price IS NOT NULL 
+        AND close_price != 0
+        AND profit IS NOT NULL
+        AND profit != 0
+        AND synced_at >= $2
+    `;
+    const countResult = await query(countQuery, [ibId, periodStart.toISOString()]);
+    const totalCount = countResult.rows[0]?.total || 0;
 
-    // Fast, throttled aggregator: fetch in parallel (concurrency 4) and accumulate
-    const fixedSum = { v: 0 };
-    const spreadSum = { v: 0 };
-    const symbolAgg = new Map();
-    const ledger = [];
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const trendMap = new Map();
+    // Fetch ALL trades for this IB from ib_trade_history
+    // Only DEALS OUT: closed positions where profit exists (profit != 0)
+    // We need all trades for aggregations, but we'll paginate the ledger separately
+    const allTradesQuery = `
+      SELECT 
+        id, order_id, account_id, symbol, order_type, volume_lots, 
+        open_price, close_price, profit, ib_commission, group_id,
+        created_at, synced_at, updated_at
+      FROM ib_trade_history
+      WHERE ib_request_id = $1
+        AND close_price IS NOT NULL 
+        AND close_price != 0
+        AND profit IS NOT NULL
+        AND profit != 0
+        AND synced_at >= $2
+      ORDER BY synced_at DESC
+    `;
 
-    const fetchTradesForAccount = async (accountId) => {
-      const url = `${MT5_API_BASE}/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${encodeURIComponent(fromDate)}&toDate=${encodeURIComponent(toDate)}`;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
-      try {
-        const r = await fetch(url, { headers: { accept: '*/*' }, signal: controller.signal });
-        if (!r.ok) return;
-        const j = await r.json();
-        const items = Array.isArray(j?.Items) ? j.Items : [];
-        const groupId = accountToGroup.get(String(accountId)) || '';
-        let rule = null;
-        for (const k of makeKeys(groupId)) { if (approvedMap.has(k)) { rule = approvedMap.get(k); break; } }
-        if (!rule) return;
-        const usdPerLot = Number(rule.usdPerLot || 0);
-        const spreadPct = Number(rule.spreadSharePercentage || 0);
-        for (const t of items) {
-          const orderType = String(t?.OrderType || '').toLowerCase().trim();
-          const closePrice = Number(t?.ClosePrice || 0);
-          const openPrice = Number(t?.OpenPrice || 0);
-          const volume = Number(t?.Volume || 0);
-          if (orderType !== 'buy' && orderType !== 'sell') continue;
-          if (!closePrice || !openPrice || !volume) continue;
-          const volumeLots = volume < 0.1 ? volume * 1000 : volume;
-          const fixed = volumeLots * usdPerLot;
-          const spread = volumeLots * (spreadPct / 100);
-          fixedSum.v += fixed;
-          spreadSum.v += spread;
-          const symbol = String(t?.Symbol || '');
-          const s = symbolAgg.get(symbol) || { symbol, trades: 0, lots: 0, fixed: 0, spread: 0, commission: 0 };
-          s.trades += 1; s.lots += volumeLots; s.fixed += fixed; s.spread += spread; s.commission = s.fixed + s.spread; symbolAgg.set(symbol, s);
-          const closeTime = t?.CloseTime || t?.close_time || new Date().toISOString();
-          ledger.push({
-            date: closeTime,
-            client: '—',
-            mt5Account: String(accountId),
-            group: (String(groupId || '').toLowerCase().includes('pro') ? 'Pro' : 'Standard'),
+    const allTradesResult = await query(allTradesQuery, [ibId, periodStart.toISOString()]);
+    const allTrades = allTradesResult.rows;
+
+    // Calculate spread commission for each trade
+    const enrichedTrades = allTrades.map(trade => {
+      const groupId = trade.group_id || '';
+      const normGroup = normalize(groupId);
+      const assignment = assignmentMap.get(normGroup) || assignmentMap.get(String(groupId).toLowerCase()) || { spreadSharePercentage: 0 };
+      const spreadCommission = Number(trade.volume_lots || 0) * (assignment.spreadSharePercentage / 100);
+      const totalCommission = Number(trade.ib_commission || 0) + spreadCommission;
+
+      return {
+        ...trade,
+        spreadCommission,
+        totalCommission,
+        profit: Number(trade.profit || 0),
+        volumeLots: Number(trade.volume_lots || 0),
+        ibCommission: Number(trade.ib_commission || 0)
+      };
+    });
+
+    // Calculate statistics
+    const totalCommission = enrichedTrades.reduce((sum, t) => sum + t.totalCommission, 0);
+    const fixedCommission = enrichedTrades.reduce((sum, t) => sum + t.ibCommission, 0);
+    const spreadCommission = enrichedTrades.reduce((sum, t) => sum + t.spreadCommission, 0);
+    const totalProfit = enrichedTrades.reduce((sum, t) => sum + t.profit, 0);
+    const totalVolume = enrichedTrades.reduce((sum, t) => sum + t.volumeLots, 0);
+    const totalTrades = enrichedTrades.length;
+
+    // This month's commission
+    const thisMonthTrades = enrichedTrades.filter(t => new Date(t.synced_at) >= startOfMonth);
+    const thisMonth = thisMonthTrades.reduce((sum, t) => sum + t.totalCommission, 0);
+
+    // Average daily commission
+    const avgDaily = period > 0 ? totalCommission / period : 0;
+
+    // Active clients (distinct account IDs)
+    const activeClients = new Set(enrichedTrades.map(t => String(t.account_id))).size;
+
+    // Top 7 symbols by commission
+    const symbolStats = new Map();
+    enrichedTrades.forEach(trade => {
+      const symbol = trade.symbol;
+      if (!symbolStats.has(symbol)) {
+        symbolStats.set(symbol, {
             symbol,
-            lots: volumeLots,
-            commission: fixed,
-            spreadCommission: spread,
-            totalCommission: fixed + spread
-          });
-          // Monthly trend aggregate
-          const d = new Date(closeTime);
-          if (!Number.isNaN(d.getTime()) && d.getFullYear() === (new Date()).getFullYear()) {
-            const label = months[d.getMonth()];
-            trendMap.set(label, (trendMap.get(label) || 0) + fixed + spread);
-          }
-        }
-      } catch { /* ignore */ }
-      finally { clearTimeout(timer); }
+          commission: 0,
+          trades: 0,
+          volume: 0,
+          profit: 0,
+          fixedCommission: 0,
+          spreadCommission: 0
+        });
+      }
+      const stats = symbolStats.get(symbol);
+      stats.commission += trade.totalCommission;
+      stats.fixedCommission += trade.ibCommission;
+      stats.spreadCommission += trade.spreadCommission;
+      stats.trades += 1;
+      stats.volume += trade.volumeLots;
+      stats.profit += trade.profit;
+    });
+
+    const topSymbols = Array.from(symbolStats.values())
+      .sort((a, b) => b.commission - a.commission)
+      .slice(0, 7)
+      .map(s => ({
+        symbol: s.symbol,
+        category: detectCategory(s.symbol),
+        commission: s.commission,
+        trades: s.trades,
+        volume: s.volume,
+        profit: s.profit,
+        fixedCommission: s.fixedCommission,
+        spreadCommission: s.spreadCommission
+      }));
+
+    // Monthly trend (last 12 months)
+    const monthlyTrendMap = new Map();
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    enrichedTrades.forEach(trade => {
+      const date = new Date(trade.synced_at);
+      const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      const monthLabel = months[date.getMonth()];
+      if (!monthlyTrendMap.has(monthKey)) {
+        monthlyTrendMap.set(monthKey, { month: monthLabel, commission: 0 });
+      }
+      monthlyTrendMap.get(monthKey).commission += trade.totalCommission;
+    });
+
+    const monthlyTrend = Array.from(monthlyTrendMap.values())
+      .sort((a, b) => a.month.localeCompare(b.month))
+      .slice(-12);
+
+    // Commission by category
+    const categoryMap = new Map();
+    enrichedTrades.forEach(trade => {
+      const category = detectCategory(trade.symbol);
+      if (!categoryMap.has(category)) {
+        categoryMap.set(category, 0);
+      }
+      categoryMap.set(category, categoryMap.get(category) + trade.totalCommission);
+    });
+
+    const categoryData = Array.from(categoryMap.entries()).map(([name, value]) => ({
+      name,
+      value
+    }));
+
+    // Paginated recent ledger (only DEALS OUT from ib_trade_history)
+    // Only show closed positions where profit exists (profit != 0)
+    // Use database-level pagination for better performance
+    const ledgerQuery = `
+      SELECT 
+        id, order_id, account_id, symbol, order_type, volume_lots, 
+        open_price, close_price, profit, ib_commission, group_id,
+        created_at, synced_at, updated_at
+      FROM ib_trade_history
+      WHERE ib_request_id = $1
+        AND close_price IS NOT NULL 
+        AND close_price != 0
+        AND profit IS NOT NULL
+        AND profit != 0
+        AND synced_at >= $2
+      ORDER BY synced_at DESC
+      LIMIT $3 OFFSET $4
+    `;
+
+    const ledgerResult = await query(ledgerQuery, [ibId, periodStart.toISOString(), limit, offset]);
+    const ledgerTrades = ledgerResult.rows;
+
+    // Enrich paginated ledger trades with spread commission
+    const recentLedger = ledgerTrades.map(trade => {
+      const groupId = trade.group_id || '';
+      const normGroup = normalize(groupId);
+      const assignment = assignmentMap.get(normGroup) || assignmentMap.get(String(groupId).toLowerCase()) || { spreadSharePercentage: 0 };
+      const spreadCommission = Number(trade.volume_lots || 0) * (assignment.spreadSharePercentage / 100);
+      const totalCommission = Number(trade.ib_commission || 0) + spreadCommission;
+
+      return {
+        id: trade.id,
+        orderId: trade.order_id,
+        date: trade.synced_at || trade.updated_at || trade.created_at,
+        accountId: trade.account_id,
+        symbol: trade.symbol,
+        orderType: trade.order_type,
+        volumeLots: Number(trade.volume_lots || 0),
+        openPrice: Number(trade.open_price || 0),
+        closePrice: Number(trade.close_price || 0),
+        profit: Number(trade.profit || 0),
+        commission: Number(trade.ib_commission || 0),
+        spreadCommission,
+        totalCommission,
+        groupId: trade.group_id || 'N/A'
+      };
+    });
+
+    const totalPages = Math.ceil(totalCount / limit);
+
+    // Comprehensive report data
+    const reportData = {
+      totalTrades,
+      totalVolume,
+      avgCommissionPerTrade: totalTrades > 0 ? totalCommission / totalTrades : 0,
+      totalProfit,
+      bestPerformingSymbol: topSymbols.length > 0 ? topSymbols[0] : null,
+      mostActiveSymbol: Array.from(symbolStats.values())
+        .sort((a, b) => b.trades - a.trades)[0] || null,
+      commissionToProfitRatio: totalProfit !== 0 ? totalCommission / Math.abs(totalProfit) : 0
     };
-
-    // Concurrency throttle (4)
-    const accIds = Array.from(allowedAccounts);
-    const chunkSize = 4;
-    for (let i = 0; i < accIds.length; i += chunkSize) {
-      const batch = accIds.slice(i, i + chunkSize);
-      // eslint-disable-next-line no-await-in-loop
-      await Promise.allSettled(batch.map(id => fetchTradesForAccount(id)));
-    }
-
-    const now = new Date();
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const periodStart = new Date(now.getTime() - period * 24 * 60 * 60 * 1000);
-
-    // Compose final data
-    const filtered = []; // we no longer need the full rows; keep empty placeholder for downstream shape we replaced below
-
-    // Aggregations
-    const sumFixed = (arr) => arr.reduce((s, x) => s + Number(x.ib_commission || 0), 0);
-    const sumSpread = (arr) => arr.reduce((s, x) => s + (Number(x.volume_lots || 0) * (Number(x.spread_pct || 0) / 100)), 0);
-
-    const fixedTotal = fixedSum.v;
-    const spreadTotal = spreadSum.v;
-    const totalCommission = fixedTotal + spreadTotal;
-
-    const thisMonthArr = filtered.filter(r => new Date(r.synced_at) >= startOfMonth);
-    const thisMonth = sumFixed(thisMonthArr) + sumSpread(thisMonthArr);
-
-    const periodArr = filtered.filter(r => new Date(r.synced_at) >= periodStart);
-    const periodTotal = sumFixed(periodArr) + sumSpread(periodArr);
-    const avgDaily = periodTotal / period;
-
-    // Top symbols
-    const topSymbols = Array.from(symbolAgg.values())
-      .sort((a,b)=> b.commission - a.commission)
-      .slice(0,20)
-      .map(x => ({ symbol: x.symbol, category: '—', pips: 0, commission: x.commission, fixedCommission: x.fixed, spreadCommission: x.spread, trades: x.trades }));
-
-    // Recent ledger
-    const recentLedger = ledger
-      .sort((a,b)=> new Date(b.date) - new Date(a.date))
-      .slice(0,200);
-
-    // Monthly trend for current year
-    const monthlyTrend = months.map(m => ({ month: m, commission: Number(trendMap.get(m) || 0) }))
-      .filter(x => x.commission > 0 || months.indexOf(x.month) === now.getMonth());
-
-    // Basic category split by symbol prefix (fallback when no mapping table)
-    const catMap = {};
-    for (const t of topSymbols) {
-      const cat = /^[A-Z]{3}USD|^XAU|^XAG/.test(t.symbol) ? 'Forex' : 'Other';
-      catMap[cat] = (catMap[cat] || 0) + Number(t.commission || 0);
-    }
-    const categoryData = Object.entries(catMap).map(([name, value]) => ({ name, value }));
-
-    // Active clients = distinct MT5 accounts contributing commission
-    const activeClients = new Set(filtered.map(r => String(r.account_id))).size;
 
     const payload = { 
-      stats: { totalCommission, fixedCommission: fixedTotal, spreadCommission: spreadTotal, thisMonth, avgDaily },
+      stats: {
+        totalCommission,
+        fixedCommission,
+        spreadCommission,
+        thisMonth,
+        avgDaily,
       activeClients,
+        totalTrades,
+        totalVolume,
+        totalProfit
+      },
       topSymbols,
       recentLedger,
       monthlyTrend,
-      categoryData
+      categoryData,
+      reportData,
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalItems: totalCount,
+        itemsPerPage: limit,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1
+      }
     };
 
-    // cache for 60 seconds
-    analyticsCache.set(cacheKey, { expires: Date.now() + 60_000, payload });
+    // Cache for 5 minutes (300,000 ms)
+    analyticsCache.set(cacheKey, { expires: Date.now() + 300_000, payload });
     res.json({ success: true, data: payload });
   } catch (e) {
     console.error('Commission analytics error:', e);
-    res.status(500).json({ success: false, message: 'Unable to fetch commission analytics' });
+    res.status(500).json({ success: false, message: 'Unable to fetch commission analytics', error: process.env.NODE_ENV !== 'production' ? String(e) : undefined });
   }
 });
+
+// Helper function to detect symbol category
+function detectCategory(symbol) {
+  if (!symbol) return 'Other';
+  const s = String(symbol).toUpperCase();
+  if (/^[A-Z]{3}USD$/.test(s) || /^USD[A-Z]{3}$/.test(s) || /^XAUUSD$/.test(s) || /^XAGUSD$/.test(s)) {
+    return 'Forex';
+  }
+  if (/^BTC|^ETH|^LTC|^XRP|^DOGE/.test(s)) {
+    return 'Crypto';
+  }
+  if (/^[A-Z]{2,4}$/.test(s) && (s.includes('US') || s.includes('EU'))) {
+    return 'Indices';
+  }
+  return 'Other';
+}
 
 // GET /api/user/commission -> totals and history
 router.get('/commission', authenticateToken, async (req, res) => {
