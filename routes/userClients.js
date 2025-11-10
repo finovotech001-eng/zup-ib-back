@@ -7,63 +7,69 @@ const router = express.Router();
 // Get clients for logged-in IB user
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
+    // req.user.id is already the IB request ID from authenticateToken
+    const ibRequestId = req.user.id;
 
-    // Get IB request ID for this user
-    const ibResult = await query(
-      `SELECT id FROM ib_requests WHERE email = (SELECT email FROM "User" WHERE id = $1) AND status = 'approved'`,
-      [userId]
+    // Get current IB's details (the referrer for all clients)
+    const currentIBResult = await query(
+      `SELECT id, full_name, email, referral_code FROM ib_requests WHERE id = $1`,
+      [ibRequestId]
     );
-
-    if (ibResult.rows.length === 0) {
-      return res.json({
-        success: true,
-        data: {
-          clients: [],
-          stats: {
-            totalClients: 0,
-            totalVolume: 0,
-            totalCommission: 0,
-            activeTraders: 0
-          }
-        }
-      });
-    }
-
-    const ibRequestId = ibResult.rows[0].id;
+    const currentIB = currentIBResult.rows[0] || null;
 
     // Get clients referred by this IB (from ib_requests.referred_by)
+    // Include all referral details from database
     const clientsResult = await query(`
       SELECT 
         ib.id as ib_id,
         ib.full_name as user_name,
         ib.email as user_email,
-        ib.submitted_at as linked_at,
+        ib.submitted_at,
+        ib.approved_at,
         ib.ib_type,
         ib.status,
+        ib.referral_code,
+        ib.referred_by,
+        ib.usd_per_lot,
+        ib.spread_percentage_per_lot,
         COALESCE(SUM(th.volume_lots), 0) as direct_volume_lots,
         COALESCE(SUM(th.ib_commission), 0) as direct_commission,
-        COUNT(DISTINCT ma."accountId") as account_count
+        COUNT(DISTINCT CASE WHEN ma."accountType" = 'real' THEN ma."accountId" END) as account_count
       FROM ib_requests ib
       LEFT JOIN "User" u ON u.email = ib.email
       LEFT JOIN "MT5Account" ma ON ma."userId" = u.id
       LEFT JOIN ib_trade_history th ON th.ib_request_id = ib.id
+        AND th.close_price IS NOT NULL 
+        AND th.close_price != 0
+        AND th.profit IS NOT NULL
+        AND th.profit != 0
       WHERE ib.referred_by = $1
-      GROUP BY ib.id, ib.full_name, ib.email, ib.submitted_at, ib.ib_type, ib.status
+      GROUP BY ib.id, ib.full_name, ib.email, ib.submitted_at, ib.approved_at, 
+               ib.ib_type, ib.status, ib.referral_code, ib.referred_by, 
+               ib.usd_per_lot, ib.spread_percentage_per_lot
       ORDER BY ib.submitted_at DESC
     `, [ibRequestId]);
 
     const clients = clientsResult.rows.map(row => ({
+      id: row.ib_id,
       userId: row.ib_id,
       name: row.user_name,
       email: row.user_email,
       accountId: '-',
-      joinDate: row.linked_at,
+      joinDate: row.submitted_at,
+      approvedDate: row.approved_at,
       totalLots: Number(row.direct_volume_lots || 0),
       commission: Number(row.direct_commission || 0),
       accountCount: parseInt(row.account_count || 0),
-      ibType: row.ib_type,
-      status: row.status,
+      ibType: row.ib_type || 'N/A',
+      status: row.status || 'pending',
+      referralCode: row.referral_code || 'N/A',
+      referredById: row.referred_by,
+      referredByName: currentIB ? currentIB.full_name : 'You',
+      referredByEmail: currentIB ? currentIB.email : null,
+      referredByCode: currentIB ? currentIB.referral_code : null,
+      usdPerLot: Number(row.usd_per_lot || 0),
+      spreadPercentage: Number(row.spread_percentage_per_lot || 0),
       lastTrade: null
     }));
 

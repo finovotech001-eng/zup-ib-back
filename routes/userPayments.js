@@ -27,39 +27,69 @@ async function selectPaymentRowsByUser(tableName, userId) {
   return [];
 }
 
-// Normalize a payment-method row into a common shape and filter to approved USDT
-function normalizeUsdtRow(row) {
-  const address = row.address || row.walletAddress || row.usdtAddress || row.crypto_address || row.wallet || null;
-  const currency = String(row.currency || row.asset || 'usdt').toLowerCase();
-  const methodStr = String(row.method || row.type || '').toLowerCase();
-  const network = String(row.network || '').toLowerCase();
-  const status = String(row.status || 'approved').toLowerCase();
-  const isUSDT = currency === 'usdt' || methodStr.startsWith('usdt');
-  const isNetworkOk = !network || ['trc20','erc20','bep20'].some(n => network.includes(n.replace('20','')) || network === n);
-  const isApproved = ['approved','active'].includes(status);
-  if (!address || !isUSDT || !isNetworkOk || !isApproved) return null;
-  return { id: row.id, address, currency: 'usdt', network: network || 'trc20' };
+// Normalize a payment-method row into a common shape for all approved methods
+function normalizePaymentRow(row) {
+  const status = String(row.status || '').toLowerCase();
+  const isApproved = status === 'approved';
+  if (!isApproved) return null;
+
+  const methodType = String(row.methodType || '').toLowerCase();
+  
+  if (methodType === 'crypto') {
+    const address = row.address || '';
+    const currency = String(row.currency || 'USDT').toUpperCase();
+    const network = String(row.network || 'TRC20').toUpperCase();
+    if (!address) return null;
+    return { 
+      id: row.id, 
+      type: 'crypto',
+      method: `${currency} (${network})`,
+      details: address,
+      currency,
+      network
+    };
+  } else if (methodType === 'bank') {
+    const bankName = row.bankName || '';
+    const accountName = row.accountName || '';
+    const accountNumber = row.accountNumber || '';
+    const accountType = row.accountType || '';
+    if (!accountNumber) return null;
+    return {
+      id: row.id,
+      type: 'bank',
+      method: `Bank - ${bankName}`,
+      details: `${accountName} - ${accountNumber}`,
+      bankName,
+      accountName,
+      accountNumber,
+      accountType
+    };
+  }
+  return null;
 }
 
-// Helper: fetch approved USDT addresses for a user from known payment method tables
-async function getApprovedUsdtAddressesForUser(userEmail) {
+// Helper: fetch all approved payment methods for a user
+async function getApprovedPaymentMethodsForUser(userEmail) {
   try {
-    // Resolve User.id by email (case-insensitive)
-    const userRes = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [userEmail]);
-    if (!userRes.rows.length) return [];
-    const userId = userRes.rows[0].id;
+    // Fetch using a robust join to avoid relying on a non-existent email column
+    // and to be case-insensitive on both sides.
+    const res = await query(
+      `SELECT p.*
+         FROM "PaymentMethod" p
+         JOIN "User" u ON u.id = p."userId"
+        WHERE LOWER(u.email) = LOWER($1)
+          AND LOWER(COALESCE(p.status, '')) = 'approved'`,
+      [userEmail]
+    );
 
-    const tables = ['"PaymentMethod"', '"PaymentMthod"', 'payment_methods'];
     const results = [];
-    for (const tbl of tables) {
-      const rows = await selectPaymentRowsByUser(tbl, userId);
-      for (const row of rows) {
-        const norm = normalizeUsdtRow(row);
-        if (norm) results.push(norm);
-      }
+    for (const row of (res.rows || [])) {
+      const norm = normalizePaymentRow(row);
+      if (norm) results.push(norm);
     }
     return results;
-  } catch (_) {
+  } catch (e) {
+    console.error('Error in getApprovedPaymentMethodsForUser:', e);
     return [];
   }
 }
@@ -71,8 +101,8 @@ router.get('/withdrawals/summary', authenticateToken, async (req, res) => {
     const period = Math.max(parseInt(req.query.period || '30', 10), 1);
     const summary = await IBWithdrawal.getSummary(ibId, { periodDays: period });
     const recent = await IBWithdrawal.list(ibId, 10);
-    const usdtAddresses = await getApprovedUsdtAddressesForUser(req.user.email);
-    res.json({ success: true, data: { summary, recent, usdtAddresses } });
+    const paymentMethods = await getApprovedPaymentMethodsForUser(req.user.email);
+    res.json({ success: true, data: { summary, recent, paymentMethods } });
   } catch (e) {
     console.error('Withdrawals summary error:', e);
     res.status(500).json({ success: false, message: 'Unable to fetch withdrawal summary' });
@@ -90,18 +120,25 @@ router.post('/withdrawals', authenticateToken, async (req, res) => {
     if (!paymentMethod) {
       return res.status(400).json({ success: false, message: 'Payment method required' });
     }
-    // Auto-fill USDT address from approved payment methods if not provided
-    if (String(paymentMethod).toLowerCase().startsWith('usdt') && !accountDetails) {
-      const list = await getApprovedUsdtAddressesForUser(req.user.email);
-      accountDetails = list?.[0]?.address || '';
-      if (!accountDetails) {
-        return res.status(400).json({ success: false, message: 'No approved USDT address on file' });
-      }
+    // Resolve method label/details using user's approved methods
+    const approved = await getApprovedPaymentMethodsForUser(req.user.email);
+    let methodLabel = String(paymentMethod);
+    const chosen = approved.find(m => String(m.id) === String(paymentMethod));
+    if (chosen) {
+      methodLabel = chosen.method;
+      if (!accountDetails) accountDetails = chosen.details || '';
+    } else if (!accountDetails) {
+      // If the provided value isn't an approved id and no details provided,
+      // fall back to the first approved method's details.
+      accountDetails = approved?.[0]?.details || '';
+    }
+    if (!accountDetails) {
+      return res.status(400).json({ success: false, message: 'No approved payment method on file' });
     }
     const created = await IBWithdrawal.create({
       ibRequestId: ibId,
       amount,
-      method: paymentMethod,
+      method: methodLabel,
       accountDetails,
     });
     const summary = await IBWithdrawal.getSummary(ibId);

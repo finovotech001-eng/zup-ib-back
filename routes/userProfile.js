@@ -849,7 +849,7 @@ router.put('/referral-code', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/user/ib-tree -> simplified tree built from referrals
+// GET /api/user/ib-tree -> simplified tree built from referrals with full details
 router.get('/ib-tree', authenticateToken, async (req, res) => {
   try {
     const rootId = req.user.id;
@@ -857,7 +857,12 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
     const getOwnStats = async (ibId) => {
       const r = await query(
         `SELECT COALESCE(SUM(volume_lots),0) as own_lots, COUNT(*)::int as trade_count
-         FROM ib_trade_history WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+         FROM ib_trade_history 
+         WHERE ib_request_id = $1 
+           AND close_price IS NOT NULL 
+           AND close_price != 0 
+           AND profit IS NOT NULL
+           AND profit != 0`,
         [ibId]
       );
       const row = r.rows[0] || {};
@@ -865,22 +870,43 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
     };
 
     const getIb = async (ibId) => {
-      const r = await query('SELECT id, full_name, email, status FROM ib_requests WHERE id = $1', [ibId]);
+      const r = await query(
+        `SELECT 
+          id, full_name, email, status, ib_type, referral_code, 
+          referred_by, submitted_at, approved_at, usd_per_lot, 
+          spread_percentage_per_lot
+         FROM ib_requests 
+         WHERE id = $1`, 
+        [ibId]
+      );
+      return r.rows[0] || null;
+    };
+
+    const getReferrerDetails = async (referredById) => {
+      if (!referredById) return null;
+      const r = await query(
+        `SELECT id, full_name, email, referral_code 
+         FROM ib_requests 
+         WHERE id = $1`,
+        [referredById]
+      );
       return r.rows[0] || null;
     };
 
     const getChildren = async (ibId) => {
-      const r = await query('SELECT id FROM ib_requests WHERE referred_by = $1', [ibId]);
+      const r = await query('SELECT id FROM ib_requests WHERE referred_by = $1 ORDER BY submitted_at DESC', [ibId]);
       return r.rows.map(x => x.id);
     };
 
     const build = async (ibId) => {
       const ib = await getIb(ibId);
       if (!ib) return null;
+      
       const { ownLots, tradeCount } = await getOwnStats(ibId);
       const childIds = await getChildren(ibId);
       const children = [];
       let teamLots = 0;
+      
       for (const cid of childIds) {
         const node = await build(cid);
         if (node) {
@@ -888,12 +914,47 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
           teamLots += node.ownLots + (node.teamLots || 0);
         }
       }
-      return { id: ib.id, name: ib.full_name, email: ib.email, status: ib.status, ownLots, tradeCount, teamLots, children };
+      
+      // Get referrer details if this IB was referred by someone
+      const referrer = ib.referred_by ? await getReferrerDetails(ib.referred_by) : null;
+      
+      return { 
+        id: ib.id, 
+        name: ib.full_name, 
+        email: ib.email, 
+        status: ib.status,
+        ibType: ib.ib_type || 'N/A',
+        referralCode: ib.referral_code || 'N/A',
+        referredBy: ib.referred_by,
+        referredByName: referrer ? referrer.full_name : null,
+        referredByEmail: referrer ? referrer.email : null,
+        referredByCode: referrer ? referrer.referral_code : null,
+        submittedAt: ib.submitted_at,
+        approvedAt: ib.approved_at,
+        usdPerLot: Number(ib.usd_per_lot || 0),
+        spreadPercentage: Number(ib.spread_percentage_per_lot || 0),
+        ownLots, 
+        tradeCount, 
+        teamLots, 
+        children 
+      };
     };
 
     const root = await build(rootId);
-    const totalTrades = (function count(n) { if (!n) return 0; return Number(n.tradeCount || 0) + (n.children || []).reduce((s,c)=> s+count(c),0); })(root);
-    res.json({ success: true, data: { ownLots: Number(root?.ownLots || 0), teamLots: Number(root?.teamLots || 0), totalTrades, root } });
+    const totalTrades = (function count(n) { 
+      if (!n) return 0; 
+      return Number(n.tradeCount || 0) + (n.children || []).reduce((s,c)=> s+count(c),0); 
+    })(root);
+    
+    res.json({ 
+      success: true, 
+      data: { 
+        ownLots: Number(root?.ownLots || 0), 
+        teamLots: Number(root?.teamLots || 0), 
+        totalTrades, 
+        root 
+      } 
+    });
   } catch (e) {
     console.error('IB tree error:', e);
     res.status(500).json({ success: false, message: 'Unable to fetch IB tree' });

@@ -4,7 +4,7 @@ import { MT5Groups } from './MT5Groups.js';
 import { GroupCommissionStructures } from './GroupCommissionStructures.js';
 
 const STATUS_VALUES = ['pending', 'approved', 'rejected', 'banned'];
-const IB_TYPE_VALUES = ['common', 'advanced', 'bronze', 'silver', 'gold', 'platinum', 'brilliant'];
+const IB_TYPE_VALUES = ['common', 'advanced', 'bronze', 'silver', 'gold', 'platinum', 'brilliant', 'standard'];
 
 export const IB_REQUEST_STATUS_VALUES = Object.freeze([...STATUS_VALUES]);
 export const IB_REQUEST_TYPE_VALUES = Object.freeze([...IB_TYPE_VALUES]);
@@ -101,22 +101,8 @@ export class IBRequest {
       WHERE status IS NULL OR LOWER(TRIM(status)) NOT IN (${allowedStatusesList});
     `);
 
-    await query(`
-      UPDATE ib_requests
-      SET ib_type = LOWER(TRIM(ib_type))
-      WHERE ib_type IS NOT NULL AND ib_type <> LOWER(TRIM(ib_type));
-    `);
-
-    await query(`
-      UPDATE ib_requests
-      SET ib_type = 'common'
-      WHERE ib_type IS NULL OR LOWER(TRIM(ib_type)) NOT IN (${allowedIbTypesList});
-    `);
-
     await query(`ALTER TABLE ib_requests ALTER COLUMN status SET DEFAULT 'pending';`);
     await query(`ALTER TABLE ib_requests ALTER COLUMN status SET NOT NULL;`);
-    await query(`ALTER TABLE ib_requests ALTER COLUMN ib_type SET DEFAULT 'common';`);
-    await query(`ALTER TABLE ib_requests ALTER COLUMN ib_type SET NOT NULL;`);
 
     await query(`
       DO $$
@@ -170,14 +156,11 @@ export class IBRequest {
       RETURNING *;
     `;
 
-    const normalizedType = typeof ibType === 'string' ? ibType.toLowerCase() : null;
-    const finalType = IB_TYPE_VALUES.includes(normalizedType) ? normalizedType : 'common';
-
     const result = await query(queryText, [
       fullName,
       email,
       passwordHash,
-      finalType,
+      ibType || null,
       referredBy || null
     ]);
 
@@ -206,9 +189,6 @@ export class IBRequest {
     const { fullName, password, ibType, referredBy } = updateData;
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const normalizedType = typeof ibType === 'string' ? ibType.toLowerCase() : null;
-    const finalType = IB_TYPE_VALUES.includes(normalizedType) ? normalizedType : 'common';
-
     // Build query dynamically based on whether referredBy is provided
     let queryText;
     let params;
@@ -229,7 +209,7 @@ export class IBRequest {
         WHERE id = $4
         RETURNING *;
       `;
-      params = [fullName, passwordHash, finalType, id, referredBy || null];
+      params = [fullName, passwordHash, ibType || null, id, referredBy || null];
     } else {
       queryText = `
         UPDATE ib_requests
@@ -245,7 +225,7 @@ export class IBRequest {
         WHERE id = $4
         RETURNING *;
       `;
-      params = [fullName, passwordHash, finalType, id];
+      params = [fullName, passwordHash, ibType || null, id];
     }
 
     const result = await query(queryText, params);
