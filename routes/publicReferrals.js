@@ -44,7 +44,7 @@ router.post('/attach', async (req, res) => {
 // then upsert into ib_referrals linking to the newly created/located user.
 router.post('/register', async (req, res) => {
   try {
-    const { referralCode, email, fullName, password, source } = req.body || {};
+    const { referralCode, email, fullName, password, phone, source } = req.body || {};
     if (!referralCode || !email) {
       return res.status(400).json({ success: false, message: 'referralCode and email are required' });
     }
@@ -78,6 +78,35 @@ router.post('/register', async (req, res) => {
     } catch (e) {
       console.error('Ensure User failed:', e.message);
       // Proceed without failing hard; ib_referrals will still be created and can backfill user_id later
+    }
+
+    // Best-effort: update user profile details (name, phone) if columns exist
+    if (userId && (fullName || phone)) {
+      try {
+        const cols = await query(`SELECT column_name FROM information_schema.columns WHERE table_name IN ('User','user')`);
+        const names = new Set(cols.rows.map(r => r.column_name));
+        const sets = [];
+        const vals = [];
+        let idx = 1;
+        if (fullName) {
+          if (names.has('name')) { sets.push(`name = $${idx++}`); vals.push(fullName); }
+          if (names.has('full_name')) { sets.push(`full_name = $${idx++}`); vals.push(fullName); }
+          if (names.has('first_name')) { const fn = String(fullName).split(' ')[0] || fullName; sets.push(`first_name = $${idx++}`); vals.push(fn); }
+          if (names.has('last_name')) { const parts = String(fullName).split(' '); const ln = parts.slice(1).join(' ') || parts[0]; sets.push(`last_name = $${idx++}`); vals.push(ln); }
+          if (names.has('firstName')) { const fn = String(fullName).split(' ')[0] || fullName; sets.push(`"firstName" = $${idx++}`); vals.push(fn); }
+          if (names.has('lastName')) { const parts = String(fullName).split(' '); const ln = parts.slice(1).join(' ') || parts[0]; sets.push(`"lastName" = $${idx++}`); vals.push(ln); }
+        }
+        if (phone) {
+          const phoneCols = ['phone','phone_number','phonenumber','mobile','mobile_number','contact_number'];
+          for (const c of phoneCols) { if (names.has(c)) { sets.push(`${c} = $${idx++}`); vals.push(phone); } }
+        }
+        if (sets.length) {
+          vals.push(userId);
+          await query(`UPDATE "User" SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
+        }
+      } catch (e) {
+        console.warn('Optional User profile update failed:', e.message);
+      }
     }
 
     // Upsert referral and backfill user_id
