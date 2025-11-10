@@ -74,13 +74,32 @@ export class IBTradeHistory {
   static async upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap = {}, groupId = null }) {
     const saved = [];
     
-    // Get commission rate from map based on group or fallback to default
-    let usdPerLot = 0;
-    if (groupId && commissionMap[groupId.toLowerCase()]) {
-      usdPerLot = Number(commissionMap[groupId.toLowerCase()]?.usdPerLot || 0);
-    } else if (commissionMap['*']) {
-      usdPerLot = Number(commissionMap['*']?.usdPerLot || 0);
-    }
+    // Helper to resolve per-lot rate using multiple normalized keys
+    const resolveUsdPerLot = (gid) => {
+      if (!gid) return Number(commissionMap['*']?.usdPerLot || 0);
+      const low = String(gid).toLowerCase();
+      const candidates = new Set([
+        low,
+        low.replace(/\\\\/g, '/'),
+        low.replace(/\//g, '\\')
+      ]);
+      const parts = low.split(/[\\\\/]/);
+      if (parts.length) {
+        candidates.add(parts[parts.length - 1]);
+        const idx = parts.findIndex(p => p === 'bbook');
+        if (idx >= 0 && idx + 1 < parts.length) {
+          candidates.add(parts[idx + 1]);
+        }
+      }
+      for (const k of candidates) {
+        const v = commissionMap[k];
+        if (v && typeof v.usdPerLot !== 'undefined') return Number(v.usdPerLot || 0);
+      }
+      return Number(commissionMap['*']?.usdPerLot || 0);
+    };
+
+    // Determine commission rate once for the batch (groupId is account-level)
+    let usdPerLot = resolveUsdPerLot(groupId);
 
     for (const trade of trades) {
       try {
@@ -167,7 +186,8 @@ export class IBTradeHistory {
   // Paginated trades for a user/account used by admin route
   static async getTrades({ userId, accountId = null, groupId = null, limit = 50, offset = 0 }) {
     const params = [userId];
-    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price != 0';
+    // Only closed OUT deals: must have a close price and a realized P&L (profit != 0)
+    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0';
     if (accountId) {
       params.push(String(accountId));
       where += ` AND account_id = $${params.length}`;

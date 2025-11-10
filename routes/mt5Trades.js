@@ -36,13 +36,35 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
       'SELECT group_id, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
       [ibRequestId]
     );
-    
+
+    // Normalize a group id to a set of keys that may appear from MT5 API or DB
+    const makeKeys = (gid) => {
+      if (!gid) return [];
+      const raw = String(gid).trim();
+      const low = raw.toLowerCase();
+      const fwd = low.replace(/\\\\/g, '/');
+      const bwd = low.replace(/\//g, '\\');
+      const parts = low.split(/[\\\\/]/);
+      const last = parts[parts.length - 1] || low;
+      // Prefer the segment after 'bbook' when present (e.g., 'standard')
+      let afterBbook = null;
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] === 'bbook' && i + 1 < parts.length) { afterBbook = parts[i + 1]; break; }
+      }
+      const keys = new Set([low, fwd, bwd, last]);
+      if (afterBbook) keys.add(afterBbook);
+      return Array.from(keys);
+    };
+
     const commissionMap = assignmentsRes.rows.reduce((map, row) => {
       if (!row.group_id) return map;
-      map[row.group_id.toLowerCase()] = {
+      const payload = {
         usdPerLot: Number(row.usd_per_lot || 0),
         spreadPercentage: Number(row.spread_share_percentage || 0)
       };
+      for (const k of makeKeys(row.group_id)) {
+        map[k] = payload;
+      }
       return map;
     }, {});
     
@@ -131,13 +153,16 @@ router.post('/sync-user/:ibRequestId', authenticateAdminToken, async (req, res) 
       'SELECT group_id, usd_per_lot, spread_share_percentage FROM ib_group_assignments WHERE ib_request_id = $1',
       [ibRequestId]
     );
-    
+
     const commissionMap = assignmentsRes.rows.reduce((map, row) => {
       if (!row.group_id) return map;
-      map[row.group_id.toLowerCase()] = {
+      const payload = {
         usdPerLot: Number(row.usd_per_lot || 0),
         spreadPercentage: Number(row.spread_share_percentage || 0)
       };
+      for (const k of makeKeys(row.group_id)) {
+        map[k] = payload;
+      }
       return map;
     }, {});
     

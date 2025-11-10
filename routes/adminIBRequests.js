@@ -1264,6 +1264,18 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
     }
 
     // Add commission data and eligibility to each account
+    // Helper: produce multiple keys for matching eligibility (handles \\ vs / and short segments)
+    const makeKeys = (gidOrName) => {
+      if (!gidOrName) return [];
+      const raw = String(gidOrName).trim().toLowerCase();
+      const variants = new Set([raw, raw.replace(/\\\\/g, '/'), raw.replace(/\//g, '\\')]);
+      const parts = raw.split(/[\\\\/]/);
+      if (parts.length) variants.add(parts[parts.length - 1]);
+      const bbookIdx = parts.findIndex(p => p === 'bbook');
+      if (bbookIdx >= 0 && bbookIdx + 1 < parts.length) variants.add(parts[bbookIdx + 1]);
+      return Array.from(variants);
+    };
+
     const accountsWithCommission = accounts.map(acc => {
       const accountIdStr = String(acc.accountId);
       const commissionData = accountCommissionMap.get(accountIdStr) || { totalCommission: 0, tradeCount: 0 };
@@ -1272,35 +1284,20 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       // Try matching both groupId (full path) and group name (extracted)
       const groupIdLower = acc.groupId ? String(acc.groupId).toLowerCase() : null;
       const groupNameLower = acc.group ? String(acc.group).toLowerCase() : null;
-      
-      // Extract group name from full path if needed
-      let extractedGroupName = null;
-      if (groupIdLower) {
-        const match = groupIdLower.match(/bbook\\([^\\/]+)/i) || groupIdLower.match(/bbook\\\\([^\\/]+)/i);
-        if (match && match[1]) {
-          extractedGroupName = match[1].toLowerCase();
-        } else if (groupIdLower.includes('\\')) {
-          const parts = groupIdLower.split('\\');
-          extractedGroupName = (parts.length >= 3 ? parts[2] : parts[parts.length - 1]).toLowerCase();
-        } else if (groupIdLower.includes('/')) {
-          const parts = groupIdLower.split('/');
-          extractedGroupName = parts[parts.length - 1].toLowerCase();
-        }
-      }
-      
-      // Try matching: groupId, group name, or extracted group name
+
+      // Try a broad set of keys against eligibleGroups map
       let isEligible = false;
       let commissionInfo = null;
-      
-      if (groupIdLower && eligibleGroups.has(groupIdLower)) {
-        isEligible = true;
-        commissionInfo = eligibleGroups.get(groupIdLower);
-      } else if (groupNameLower && eligibleGroups.has(groupNameLower)) {
-        isEligible = true;
-        commissionInfo = eligibleGroups.get(groupNameLower);
-      } else if (extractedGroupName && eligibleGroups.has(extractedGroupName)) {
-        isEligible = true;
-        commissionInfo = eligibleGroups.get(extractedGroupName);
+      const candidates = [
+        ...makeKeys(groupIdLower),
+        ...makeKeys(groupNameLower)
+      ];
+      for (const key of candidates) {
+        if (eligibleGroups.has(key)) {
+          isEligible = true;
+          commissionInfo = eligibleGroups.get(key);
+          break;
+        }
       }
 
       return {
@@ -1707,12 +1704,29 @@ async function buildCommissionMap(ibId) {
     [ibId]
   );
 
+  const makeKeys = (gid) => {
+    if (!gid) return [];
+    const s = String(gid).trim().toLowerCase();
+    const fwd = s.replace(/\\\\/g, '/');
+    const bwd = s.replace(/\//g, '\\');
+    const parts = s.split(/[\\\\/]/);
+    const last = parts[parts.length - 1] || s;
+    let afterBbook = null;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === 'bbook' && i + 1 < parts.length) { afterBbook = parts[i + 1]; break; }
+    }
+    const keys = new Set([s, fwd, bwd, last]);
+    if (afterBbook) keys.add(afterBbook);
+    return Array.from(keys);
+  };
+
   const map = assignments.rows.reduce((acc, row) => {
     if (!row.group_id) return acc;
-    acc[row.group_id.toLowerCase()] = {
+    const payload = {
       usdPerLot: Number(row.usd_per_lot || 0),
       spreadPercentage: Number(row.spread_share_percentage || 0)
     };
+    for (const k of makeKeys(row.group_id)) acc[k] = payload;
     return acc;
   }, {});
 

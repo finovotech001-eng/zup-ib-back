@@ -5,14 +5,13 @@ import rateLimit from 'express-rate-limit';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
+// Socket.IO removed (chat feature disabled)
 
 // Import database and models
 import pool from './config/database.js';
 import { IBRequest } from './models/IBRequest.js';
 import { IBAdmin } from './models/IBAdmin.js';
 import { Symbols } from './models/Symbols.js';
-import { Chat } from './models/Chat.js';
 import { MT5Groups } from './models/MT5Groups.js';
 import { GroupCommissionStructures } from './models/GroupCommissionStructures.js';
 import { IBGroupAssignment } from './models/IBGroupAssignment.js';
@@ -27,7 +26,7 @@ import ibRequestRoutes from './routes/ibRequest.js';
 import adminIBRequestRoutes from './routes/adminIBRequests.js';
 import adminSymbolsRoutes from './routes/adminSymbols.js';
 import adminSymbolsWithCategoriesRoutes from './routes/adminSymbolsWithCategories.js';
-import chatRoutes from './routes/chat.js';
+// Chat routes removed
 import mt5TradesRoutes from './routes/mt5Trades.js';
 import adminTradingGroupsRoutes from './routes/adminTradingGroups.js';
 import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
@@ -97,7 +96,7 @@ async function initializeDatabase() {
     await IBRequest.createTable();
     await IBAdmin.createTable();
     await Symbols.createTable();
-    await Chat.createTables();
+    // Chat tables removed
     await MT5Groups.createTable();
     await GroupCommissionStructures.createTable();
     await IBGroupAssignment.createTable();
@@ -118,7 +117,7 @@ app.use('/api/ib-requests', ibRequestRoutes);
 app.use('/api/admin/ib-requests', adminIBRequestRoutes);
 app.use('/api/admin/symbols', adminSymbolsRoutes);
 app.use('/api/admin/symbols-with-categories', adminSymbolsWithCategoriesRoutes);
-app.use('/api/chat', chatRoutes);
+// Chat API removed
 app.use('/api/admin/mt5-trades', mt5TradesRoutes);
 app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
 app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
@@ -158,81 +157,8 @@ app.use('*', (req, res) => {
   });
 });
 
-// Create HTTP server and Socket.IO
+// Create HTTP server (no Socket.IO)
 const server = createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
-});
-
-// WebSocket connection handling
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
-
-  // Join admin room for admin users
-  socket.on('join-admin', (adminData) => {
-    socket.join('admin-room');
-    socket.adminData = adminData;
-    console.log('Admin joined:', adminData);
-  });
-
-  // Join user room for IB users
-  socket.on('join-user', (userData) => {
-    socket.join(`user-${userData.userId}`);
-    socket.userData = userData;
-    console.log('User joined:', userData);
-  });
-
-  // Handle chat messages
-  socket.on('send-message', async (messageData) => {
-    try {
-      const { conversationId, content, messageType, metadata } = messageData;
-      const senderData = socket.adminData || socket.userData;
-
-      if (!senderData || !conversationId || !content) {
-        socket.emit('message-error', { message: 'Invalid message data' });
-        return;
-      }
-
-      // Save message to database
-      const message = await Chat.saveMessage(conversationId, {
-        sender_id: senderData.id || senderData.userId,
-        sender_name: senderData.full_name || senderData.name,
-        sender_type: socket.adminData ? 'admin' : 'user'
-      }, {
-        content,
-        message_type: messageType || 'text',
-        metadata: metadata || {}
-      });
-
-      // Broadcast message to conversation participants
-      socket.emit('message-sent', { message });
-      socket.to(`conversation-${conversationId}`).emit('new-message', { message });
-
-      // Update conversation timestamp
-      await Chat.updateConversationLastMessage(conversationId);
-
-    } catch (error) {
-      console.error('Error handling message:', error);
-      socket.emit('message-error', { message: 'Failed to send message' });
-    }
-  });
-
-  // Handle typing indicators
-  socket.on('typing', (data) => {
-    socket.to(`conversation-${data.conversationId}`).emit('user-typing', {
-      userName: socket.adminData?.full_name || socket.userData?.name,
-      isTyping: data.isTyping
-    });
-  });
-
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-  });
-});
 
 // Background job to auto-sync trades every 15 minutes
 async function autoSyncTrades() {
@@ -319,7 +245,7 @@ async function start() {
 
     server.listen(PORT, () => {
       console.log(`IB Portal Server is running on port ${PORT}`);
-      console.log(`Socket.IO server is ready`);
+      // Socket.IO removed
       console.log(`Environment: ${process.env.NODE_ENV}`);
       console.log(`JWT secret configured: ${process.env.JWT_SECRET ? 'yes' : (process.env.NODE_ENV !== 'production' ? 'dev-fallback' : 'no')}`);
       

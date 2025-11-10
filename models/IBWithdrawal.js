@@ -42,18 +42,27 @@ export class IBWithdrawal {
         [ibRequestId]
       );
 
-      // Helper to normalize a group id/path
-      const normalize = (gid) => {
-        if (!gid) return '';
-        const s = String(gid).toLowerCase().trim();
-        const parts = s.split(/[\\/]/);
-        return parts[parts.length - 1] || s;
+      // Helpers to normalize and generate multiple matching keys for group ids
+      const makeKeys = (gid) => {
+        if (!gid) return [];
+        const s = String(gid).trim().toLowerCase();
+        const fwd = s.replace(/\\\\/g, '/');
+        const bwd = s.replace(/\//g, '\\');
+        const parts = s.split(/[\\\\/]/);
+        const last = parts[parts.length - 1] || s;
+        let afterBbook = null;
+        for (let i = 0; i < parts.length; i++) {
+          if (parts[i] === 'bbook' && i + 1 < parts.length) { afterBbook = parts[i + 1]; break; }
+        }
+        const keys = new Set([s, fwd, bwd, last]);
+        if (afterBbook) keys.add(afterBbook);
+        return Array.from(keys);
       };
 
       const approvedMap = assignmentsRes.rows.reduce((m, r) => {
-        const k = normalize(r.group_id);
-        if (!k) return m;
-        m[k] = Number(r.spread_share_percentage || 0);
+        for (const k of makeKeys(r.group_id)) {
+          m[k] = Number(r.spread_share_percentage || 0);
+        }
         return m;
       }, {});
 
@@ -92,8 +101,10 @@ export class IBWithdrawal {
           Array.isArray(allowed) && allowed.length ? [ibRequestId, allowed] : [ibRequestId]
         );
         for (const row of tradesRes.rows) {
-          const k = normalize(row.group_id);
-          if (!approvedMap[k]) continue; // skip non-approved groups
+          // Try multiple keys derived from this trade's group id
+          const candidates = makeKeys(row.group_id);
+          const k = candidates.find((x) => approvedMap.hasOwnProperty(x));
+          if (!k) continue; // skip non-approved groups
           const lots = Number(row.lots || 0);
           const f = Number(row.fixed || 0);
           const pct = approvedMap[k] / 100;
@@ -119,7 +130,7 @@ export class IBWithdrawal {
       const pending = Number(pendingRes.rows[0]?.pending || 0);
       const available = Math.max(totalEarned - totalPaid - pending, 0);
 
-      return { totalEarned, totalPaid, pending, available };
+      return { totalEarned, totalPaid, pending, available, fixedEarned: fixed, spreadEarned: spread };
     } catch (e) {
       // Fallback to original logic if the above fails
       const totalEarnedRes = await query(
@@ -141,7 +152,7 @@ export class IBWithdrawal {
       const totalPaid = Number(totalPaidRes.rows[0]?.total_paid || 0);
       const pending = Number(pendingRes.rows[0]?.pending || 0);
       const available = Math.max(totalEarned - totalPaid - pending, 0);
-      return { totalEarned, totalPaid, pending, available };
+      return { totalEarned, totalPaid, pending, available, fixedEarned: totalEarned, spreadEarned: 0 };
     }
   }
 
