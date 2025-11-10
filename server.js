@@ -29,6 +29,7 @@ import adminSymbolsWithCategoriesRoutes from './routes/adminSymbolsWithCategorie
 // Chat routes removed
 import mt5TradesRoutes from './routes/mt5Trades.js';
 import adminTradingGroupsRoutes from './routes/adminTradingGroups.js';
+import adminDashboardRoutes from './routes/adminDashboard.js';
 import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
 import adminIBUpgradeRoutes from './routes/adminIBUpgrade.js';
 import adminWithdrawalsRoutes from './routes/adminWithdrawals.js';
@@ -124,6 +125,7 @@ app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
 app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
 app.use('/api/admin/ib-upgrade', adminIBUpgradeRoutes);
 app.use('/api/admin/withdrawals', adminWithdrawalsRoutes);
+app.use('/api/admin/dashboard', adminDashboardRoutes);
 // Mount user-facing routes
 app.use('/api/user/clients', userClientsRoutes);
 app.use('/api/user/symbols', userSymbolsRoutes);
