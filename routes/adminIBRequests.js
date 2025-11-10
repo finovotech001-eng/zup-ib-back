@@ -2350,10 +2350,10 @@ router.post('/groups/*/commissions', authenticateAdminToken, async (req, res) =>
     });
   } catch (error) {
     console.error('Create commission structure error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Unable to create commission structure'
-    });
+    if (error?.code === '23505') {
+      return res.status(400).json({ success: false, message: 'Level already exists for this group. Please choose a unique level order.' });
+    }
+    res.status(500).json({ success: false, message: 'Unable to create commission structure' });
   }
 });
 
@@ -2381,10 +2381,10 @@ router.patch('/commissions/:id', authenticateAdminToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Update commission structure error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Unable to update commission structure'
-    });
+    if (error?.code === '23505') {
+      return res.status(400).json({ success: false, message: 'Level already exists for this group. Please choose a unique level order.' });
+    }
+    res.status(500).json({ success: false, message: 'Unable to update commission structure' });
   }
 });
 
