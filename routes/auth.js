@@ -291,6 +291,44 @@ router.get('/referrer-info', async (req, res) => {
   }
 });
 
+// User logout endpoint - destroy session and clear cookies
+// Allow logout even if token is invalid (for expired tokens, etc.)
+router.post('/logout', async (req, res) => {
+  try {
+    // Try to verify token if provided (optional)
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+      try {
+        // Verify token is valid (but don't fail if it's not)
+        jwt.verify(token, getJwtSecret());
+      } catch (error) {
+        // Token is invalid/expired, but we still allow logout
+        console.log('Logout with invalid/expired token - proceeding anyway');
+      }
+    }
+
+    // Clear any httpOnly cookies if set
+    res.clearCookie('token', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/'
+    });
+
+    res.json({
+      success: true,
+      message: 'Logout successful'
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
+    // Even if there's an error, return success to allow client-side cleanup
+    res.json({
+      success: true,
+      message: 'Logout successful'
+    });
+  }
+});
+
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const request = await IBRequest.findById(req.user.id);
