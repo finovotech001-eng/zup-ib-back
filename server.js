@@ -46,7 +46,7 @@ import userDashboardRoutes from './routes/userDashboard.js';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // CORS configuration (allow local dev + env configured)
 const allowedOrigins = [
