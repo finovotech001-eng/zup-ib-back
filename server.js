@@ -81,12 +81,37 @@ app.options('*', cors(corsOptions));
 app.use(helmet());
 
 // Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use(limiter);
+const isProd = process.env.NODE_ENV === 'production';
+if (isProd) {
+  const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // limit each IP to 100 requests per windowMs
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many requests from this IP, please try again later.'
+  });
+  app.use(globalLimiter);
+
+  // Tighter login-specific limiter (per minute)
+  const loginLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: 'Too many login attempts, please try again in a minute.'
+  });
+  app.use('/api/auth/login', loginLimiter);
+  app.use('/api/admin/login', loginLimiter);
+} else {
+  // In non-production, relax limits to avoid interrupting local development
+  const devLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 1000,
+    standardHeaders: true,
+    legacyHeaders: false
+  });
+  app.use(devLimiter);
+}
 
 // Cookie parser middleware
 app.use(cookieParser());
