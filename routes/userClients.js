@@ -73,6 +73,54 @@ router.get('/', authenticateToken, async (req, res) => {
       lastTrade: null
     }));
 
+    // 2) Include CRM-referred traders from ib_referrals (non-IB clients)
+    const crmResult = await query(`
+      SELECT 
+        r.id as ref_id,
+        r.user_id,
+        r.email as user_email,
+        r.created_at as submitted_at,
+        COUNT(DISTINCT CASE WHEN ma."accountType" = 'real' THEN ma."accountId" END) as account_count,
+        COALESCE(SUM(th.volume_lots), 0) as direct_volume_lots,
+        COALESCE(SUM(th.ib_commission), 0) as direct_commission
+      FROM ib_referrals r
+      LEFT JOIN "User" u ON u.id = r.user_id
+      LEFT JOIN "MT5Account" ma ON ma."userId" = u.id
+      LEFT JOIN ib_trade_history th ON th.ib_request_id = $1 AND th.user_id = r.user_id 
+        AND th.close_price IS NOT NULL AND th.close_price != 0 AND th.profit IS NOT NULL AND th.profit != 0
+      WHERE r.ib_request_id = $1
+      GROUP BY r.id, r.user_id, r.email, r.created_at
+      ORDER BY r.created_at DESC
+    `, [ibRequestId]);
+
+    for (const row of crmResult.rows) {
+      // Avoid duplicating if the same email is already in IB applicants list
+      const exists = clients.find(c => (c.email || '').toLowerCase() === (row.user_email || '').toLowerCase());
+      if (exists) continue;
+      clients.push({
+        id: row.ref_id,
+        userId: row.user_id || row.ref_id,
+        name: row.user_email, // we may only have email; CRM can send name later if desired
+        email: row.user_email,
+        accountId: '-',
+        joinDate: row.submitted_at,
+        approvedDate: null,
+        totalLots: Number(row.direct_volume_lots || 0),
+        commission: Number(row.direct_commission || 0),
+        accountCount: parseInt(row.account_count || 0),
+        ibType: 'Trader',
+        status: 'trader',
+        referralCode: null,
+        referredById: ibRequestId,
+        referredByName: currentIB ? currentIB.full_name : 'You',
+        referredByEmail: currentIB ? currentIB.email : null,
+        referredByCode: currentIB ? currentIB.referral_code : null,
+        usdPerLot: 0,
+        spreadPercentage: 0,
+        lastTrade: null
+      });
+    }
+
     // Get last trade date for each client
     for (const client of clients) {
       const lastTradeResult = await query(`
@@ -112,5 +160,4 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 export default router;
-
 

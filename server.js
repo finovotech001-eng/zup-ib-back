@@ -17,6 +17,7 @@ import { GroupCommissionStructures } from './models/GroupCommissionStructures.js
 import { IBGroupAssignment } from './models/IBGroupAssignment.js';
 import { IBTradeHistory } from './models/IBTradeHistory.js';
 import { IBWithdrawal } from './models/IBWithdrawal.js';
+import { IBReferral } from './models/IBReferral.js';
 // import { IBLevelUpHistory } from './models/IBLevelUpHistory.js'; // File removed
 
 // Import routes
@@ -33,6 +34,7 @@ import adminDashboardRoutes from './routes/adminDashboard.js';
 import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
 import adminIBUpgradeRoutes from './routes/adminIBUpgrade.js';
 import adminWithdrawalsRoutes from './routes/adminWithdrawals.js';
+import publicReferralsRoutes from './routes/publicReferrals.js';
 // User-facing routes
 import userClientsRoutes from './routes/userClients.js';
 import userSymbolsRoutes from './routes/userSymbols.js';
@@ -104,6 +106,7 @@ async function initializeDatabase() {
     await IBGroupAssignment.createTable();
     await IBTradeHistory.createTable();
     await IBWithdrawal.createTable();
+    await IBReferral.createTable();
     // await IBLevelUpHistory.createTable(); // File removed
     await IBAdmin.seedDefaultAdmin();
     console.log('Database tables initialized successfully');
@@ -125,6 +128,8 @@ app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
 app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
 app.use('/api/admin/ib-upgrade', adminIBUpgradeRoutes);
 app.use('/api/admin/withdrawals', adminWithdrawalsRoutes);
+// Public, unauthenticated referral endpoints (used by CRM)
+app.use('/api/public/referrals', publicReferralsRoutes);
 app.use('/api/admin/dashboard', adminDashboardRoutes);
 // Mount user-facing routes
 app.use('/api/user/clients', userClientsRoutes);
@@ -202,32 +207,48 @@ async function autoSyncTrades() {
 
         const accountsResult = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
 
-        for (const account of accountsResult.rows) {
-          const accountId = account.accountId;
-          const to = new Date().toISOString();
-          const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const syncAccountsFor = async (accountRows, ownerUserId, ownerGroupId = null) => {
+          for (const account of accountRows) {
+            const accountId = account.accountId;
+            const to = new Date().toISOString();
+            const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-          try {
-            const apiUrl = `http://18.130.5.209:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
-            const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
+            try {
+              const apiUrl = `http://18.130.5.209:5003/api/client/tradehistory/trades?accountId=${accountId}&page=1&pageSize=1000&fromDate=${from}&toDate=${to}`;
+              const response = await fetch(apiUrl, { headers: { accept: '*/*' } });
 
-            if (response.ok) {
-              const data = await response.json();
-              const trades = data.Items || [];
-              let groupId = null;
-              try {
-                const profRes = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
-                if (profRes.ok) {
-                  const prof = await profRes.json();
-                  groupId = (prof?.Data || prof?.data)?.Group || null;
-                }
-              } catch {}
+              if (response.ok) {
+                const data = await response.json();
+                const trades = data.Items || [];
+                let groupId = ownerGroupId;
+                try {
+                  const profRes = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, { headers: { accept: '*/*' } });
+                  if (profRes.ok) {
+                    const prof = await profRes.json();
+                    groupId = (prof?.Data || prof?.data)?.Group || groupId;
+                  }
+                } catch {}
 
-              await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId: ib.id, commissionMap, groupId });
-              await IBTradeHistory.calculateIBCommissions(accountId, ib.id);
+                await IBTradeHistory.upsertTrades(trades, { accountId, userId: ownerUserId, ibRequestId: ib.id, commissionMap, groupId });
+                await IBTradeHistory.calculateIBCommissions(accountId, ib.id);
+              }
+            } catch (error) {
+              console.error(`[Auto-Sync] Error syncing account ${accountId}:`, error.message);
             }
+          }
+        };
+
+        // Sync IB's own accounts
+        await syncAccountsFor(accountsResult.rows, userId, null);
+
+        // Sync referred traders' accounts
+        const refUsersRes = await query('SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL', [ib.id]);
+        for (const ref of refUsersRes.rows) {
+          try {
+            const accRes = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [ref.user_id]);
+            await syncAccountsFor(accRes.rows, ref.user_id, null);
           } catch (error) {
-            console.error(`[Auto-Sync] Error syncing account ${accountId}:`, error.message);
+            console.error(`[Auto-Sync] Error syncing referred user ${ref.user_id}:`, error.message);
           }
         }
       } catch (error) {

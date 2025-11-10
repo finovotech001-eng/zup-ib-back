@@ -898,6 +898,15 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
       return r.rows.map(x => x.id);
     };
 
+    // CRM-referred traders for this IB
+    const getReferredTraders = async (ibId) => {
+      const r = await query(
+        'SELECT id AS ref_id, user_id, email, created_at FROM ib_referrals WHERE ib_request_id = $1 ORDER BY created_at DESC',
+        [ibId]
+      );
+      return r.rows;
+    };
+
     const build = async (ibId) => {
       const ib = await getIb(ibId);
       if (!ib) return null;
@@ -906,7 +915,7 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
       const childIds = await getChildren(ibId);
       const children = [];
       let teamLots = 0;
-      
+
       for (const cid of childIds) {
         const node = await build(cid);
         if (node) {
@@ -914,6 +923,43 @@ router.get('/ib-tree', authenticateToken, async (req, res) => {
           teamLots += node.ownLots + (node.teamLots || 0);
         }
       }
+
+      // Add CRM-referred traders as leaf nodes
+      try {
+        const traders = await getReferredTraders(ibId);
+        for (const t of traders) {
+          // Stats for this referred user under this IB
+          const statsRes = await query(
+            `SELECT COALESCE(SUM(volume_lots),0) AS lots, COUNT(*)::int AS trade_count
+             FROM ib_trade_history
+             WHERE ib_request_id = $1 AND user_id = $2
+               AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+            [ibId, t.user_id]
+          );
+          const lots = Number(statsRes.rows?.[0]?.lots || 0);
+          const tradeCount = Number(statsRes.rows?.[0]?.trade_count || 0);
+          children.push({
+            id: `trader-${t.user_id || t.ref_id}`,
+            name: t.email,
+            email: t.email,
+            status: 'trader',
+            ibType: 'Trader',
+            referralCode: null,
+            referredBy: ibId,
+            referredByName: (await getReferrerDetails(ibId))?.full_name || null,
+            referredByEmail: (await getReferrerDetails(ibId))?.email || null,
+            referredByCode: (await getReferrerDetails(ibId))?.referral_code || null,
+            submittedAt: t.created_at,
+            approvedAt: null,
+            usdPerLot: 0,
+            spreadPercentage: 0,
+            ownLots: lots,
+            tradeCount,
+            teamLots: 0,
+            children: []
+          });
+        }
+      } catch {}
       
       // Get referrer details if this IB was referred by someone
       const referrer = ib.referred_by ? await getReferrerDetails(ib.referred_by) : null;

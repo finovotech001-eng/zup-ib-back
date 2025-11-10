@@ -2213,6 +2213,43 @@ async function getTreeStructure(rootIbId) {
           teamLots += childNode.ownLots + (childNode.teamLots || 0);
         }
       }
+      // Append CRM-referred traders as leaf nodes
+      try {
+        const crmRes = await query('SELECT id AS ref_id, user_id, email, created_at FROM ib_referrals WHERE ib_request_id = $1 ORDER BY created_at DESC', [ibId]);
+        for (const t of crmRes.rows) {
+          const statsRes = await query(
+            `SELECT COALESCE(SUM(volume_lots),0) AS lots, COUNT(*)::int AS trade_count, COALESCE(SUM(ib_commission),0) AS fixed
+             FROM ib_trade_history
+             WHERE ib_request_id = $1 AND user_id = $2 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+            [ibId, t.user_id]
+          );
+          const lots = Number(statsRes.rows?.[0]?.lots || 0);
+          const tradeC = Number(statsRes.rows?.[0]?.trade_count || 0);
+          const fixedTrader = Number(statsRes.rows?.[0]?.fixed || 0);
+          let accountsCnt = 0;
+          if (t.user_id) {
+            try {
+              const acc = await query('SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1', [t.user_id]);
+              accountsCnt = Number(acc.rows?.[0]?.cnt || 0);
+            } catch {}
+          }
+          children.push({
+            id: `trader-${t.user_id || t.ref_id}`,
+            name: t.email,
+            email: t.email,
+            status: 'trader',
+            ownLots: lots,
+            tradeCount: tradeC,
+            accountsCount: accountsCnt,
+            ibCommissionTotal: fixedTrader,
+            fixedCommission: fixedTrader,
+            spreadCommission: 0,
+            structures: [],
+            teamLots: 0,
+            children: []
+          });
+        }
+      } catch {}
       return {
         id: ib.id,
         name: ib.full_name,
