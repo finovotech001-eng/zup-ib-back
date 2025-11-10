@@ -17,6 +17,18 @@ router.get('/', authenticateToken, async (req, res) => {
     );
     const currentIB = currentIBResult.rows[0] || null;
 
+    // Best-effort: fetch current IB phone from User table using flexible column mapping
+    let currentIBPhone = null;
+    if (currentIB?.email) {
+      try {
+        const phoneRes = await query('SELECT * FROM "User" WHERE LOWER(email) = LOWER($1) LIMIT 1', [currentIB.email]);
+        if (phoneRes.rows.length) {
+          const u = phoneRes.rows[0];
+          currentIBPhone = u.phone || u.phone_number || u.phonenumber || u.mobile || u.mobile_number || u.contact_number || null;
+        }
+      } catch {}
+    }
+
     // Get clients referred by this IB (from ib_requests.referred_by)
     // Include all referral details from database
     const clientsResult = await query(`
@@ -67,6 +79,7 @@ router.get('/', authenticateToken, async (req, res) => {
       referredById: row.referred_by,
       referredByName: currentIB ? currentIB.full_name : 'You',
       referredByEmail: currentIB ? currentIB.email : null,
+      referredByPhone: currentIBPhone,
       referredByCode: currentIB ? currentIB.referral_code : null,
       usdPerLot: Number(row.usd_per_lot || 0),
       spreadPercentage: Number(row.spread_percentage_per_lot || 0),
@@ -115,6 +128,7 @@ router.get('/', authenticateToken, async (req, res) => {
         referredById: ibRequestId,
         referredByName: currentIB ? currentIB.full_name : 'You',
         referredByEmail: currentIB ? currentIB.email : null,
+        referredByPhone: currentIBPhone,
         referredByCode: currentIB ? currentIB.referral_code : null,
         usdPerLot: 0,
         spreadPercentage: 0,
@@ -161,3 +175,44 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 export default router;
+
+// Dedicated list of CRM-referred traders for the logged-in IB
+router.get('/traders', authenticateToken, async (req, res) => {
+  try {
+    const ibRequestId = req.user.id;
+
+    // Resolve current IB for contact details
+    const ibRes = await query('SELECT id, full_name, email FROM ib_requests WHERE id = $1', [ibRequestId]);
+    const currentIB = ibRes.rows[0] || null;
+
+    // Pull traders from ib_referrals with best-effort name/phone from User
+    const tradersRes = await query(`
+      SELECT r.id AS ref_id, r.user_id, r.email AS trader_email, r.created_at,
+             r.referral_code,
+             u.*
+      FROM ib_referrals r
+      LEFT JOIN "User" u ON (u.id::text = r.user_id)
+      WHERE r.ib_request_id = $1
+      ORDER BY r.created_at DESC
+    `, [ibRequestId]);
+
+    const mapPhone = (u) => (u?.phone || u?.phone_number || u?.phonenumber || u?.mobile || u?.mobile_number || u?.contact_number || null);
+    const mapName = (u) => (u?.name || u?.full_name || ((u?.first_name && u?.last_name) ? `${u.first_name} ${u.last_name}` : null) || ((u?.firstName && u?.lastName) ? `${u.firstName} ${u.lastName}` : null) || null);
+
+    const traders = tradersRes.rows.map(r => ({
+      id: r.ref_id,
+      email: r.trader_email,
+      name: mapName(r),
+      phone: mapPhone(r),
+      referralCode: r.referral_code,
+      createdAt: r.created_at,
+      referredByName: currentIB?.full_name || 'You',
+      referredByEmail: currentIB?.email || null
+    }));
+
+    res.json({ success: true, data: { traders } });
+  } catch (e) {
+    console.error('Error fetching traders list:', e);
+    res.status(500).json({ success: false, message: 'Unable to fetch traders' });
+  }
+});
