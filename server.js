@@ -34,6 +34,7 @@ import adminDashboardRoutes from './routes/adminDashboard.js';
 import adminCommissionDistributionRoutes from './routes/adminCommissionDistribution.js';
 import adminIBUpgradeRoutes from './routes/adminIBUpgrade.js';
 import adminWithdrawalsRoutes from './routes/adminWithdrawals.js';
+import adminReferralsRoutes from './routes/adminReferrals.js';
 import publicReferralsRoutes from './routes/publicReferrals.js';
 // User-facing routes
 import userClientsRoutes from './routes/userClients.js';
@@ -128,6 +129,8 @@ app.use('/api/admin/trading-groups', adminTradingGroupsRoutes);
 app.use('/api/admin/commission-distribution', adminCommissionDistributionRoutes);
 app.use('/api/admin/ib-upgrade', adminIBUpgradeRoutes);
 app.use('/api/admin/withdrawals', adminWithdrawalsRoutes);
+// Admin traders (CRM referrals)
+app.use('/api/admin', adminReferralsRoutes);
 // Public, unauthenticated referral endpoints (used by CRM)
 app.use('/api/public/referrals', publicReferralsRoutes);
 app.use('/api/admin/dashboard', adminDashboardRoutes);

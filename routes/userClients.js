@@ -84,7 +84,8 @@ router.get('/', authenticateToken, async (req, res) => {
         COALESCE(SUM(th.volume_lots), 0) as direct_volume_lots,
         COALESCE(SUM(th.ib_commission), 0) as direct_commission
       FROM ib_referrals r
-      LEFT JOIN "User" u ON u.id = r.user_id
+      -- Cast to text for compatibility when User.id is uuid
+      LEFT JOIN "User" u ON (u.id::text = r.user_id)
       LEFT JOIN "MT5Account" ma ON ma."userId" = u.id
       LEFT JOIN ib_trade_history th ON th.ib_request_id = $1 AND th.user_id = r.user_id 
         AND th.close_price IS NOT NULL AND th.close_price != 0 AND th.profit IS NOT NULL AND th.profit != 0
@@ -160,4 +161,3 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 export default router;
-

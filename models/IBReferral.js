@@ -7,12 +7,31 @@ export class IBReferral {
         CREATE TABLE IF NOT EXISTS ib_referrals (
           id SERIAL PRIMARY KEY,
           ib_request_id INTEGER NOT NULL REFERENCES ib_requests(id) ON DELETE CASCADE,
-          user_id INTEGER REFERENCES "User"(id) ON DELETE SET NULL,
+          -- Use TEXT for cross-compatibility (uuid/int) across environments
+          user_id TEXT,
           email TEXT NOT NULL,
           referral_code VARCHAR(16) NOT NULL,
           source TEXT DEFAULT 'crm',
           created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
+      `);
+
+      // If user_id exists but is not TEXT, migrate to TEXT to avoid uuid/text mismatches
+      await query(`
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ib_referrals' AND column_name = 'user_id' AND data_type <> 'text'
+          ) THEN
+            BEGIN
+              ALTER TABLE ib_referrals ALTER COLUMN user_id TYPE TEXT USING user_id::text;
+            EXCEPTION WHEN others THEN
+              -- If conversion fails, keep existing type without breaking startup
+              NULL;
+            END;
+          END IF;
+        END $$;
       `);
 
       // Unique index to keep one row per IB + email (case-insensitive)
@@ -69,4 +88,3 @@ export class IBReferral {
     return res.rows;
   }
 }
-
