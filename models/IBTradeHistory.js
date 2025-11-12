@@ -3,7 +3,6 @@ import { query } from '../config/database.js';
 export class IBTradeHistory {
   static async createTable() {
     try {
-      // Check if table exists
       const checkTableQuery = `
         SELECT EXISTS (
           SELECT FROM information_schema.tables 
@@ -14,12 +13,10 @@ export class IBTradeHistory {
       
       const checkResult = await query(checkTableQuery);
       const tableExists = checkResult.rows[0].exists;
-      // Do not return early; we still need to run migrations/indexes when table exists
       if (tableExists) {
         console.log('ib_trade_history table already exists; ensuring schema');
       }
       
-      // Create table
       const createTableQuery = `
         CREATE TABLE IF NOT EXISTS ib_trade_history (
           id TEXT PRIMARY KEY,
@@ -44,7 +41,6 @@ export class IBTradeHistory {
       
       await query(createTableQuery);
       
-      // Ensure new columns exist
       await query(`
         DO $$
         BEGIN
@@ -57,7 +53,6 @@ export class IBTradeHistory {
         END $$;
       `);
       
-      // Create indexes separately
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_account ON ib_trade_history (account_id);');
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_user ON ib_trade_history (user_id);');
       await query('CREATE INDEX IF NOT EXISTS idx_ib_trade_ib ON ib_trade_history (ib_request_id);');
@@ -70,11 +65,10 @@ export class IBTradeHistory {
     }
   }
 
-  // Upsert trades with optional IB commission calculation
   static async upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap = {}, groupId = null }) {
     const saved = [];
+    let skipped = { noOrderId: 0, noSymbol: 0, notBuySell: 0, notClosed: 0, noVolume: 0, errors: 0 };
     
-    // Helper to resolve per-lot rate using multiple normalized keys
     const resolveUsdPerLot = (gid) => {
       if (!gid) return Number(commissionMap['*']?.usdPerLot || 0);
       const low = String(gid).toLowerCase();
@@ -83,7 +77,7 @@ export class IBTradeHistory {
         low.replace(/\\\\/g, '/'),
         low.replace(/\//g, '\\')
       ]);
-      const parts = low.split(/[\\\\/]/);
+      const parts = low.split(/[\\\/]/);
       if (parts.length) {
         candidates.add(parts[parts.length - 1]);
         const idx = parts.findIndex(p => p === 'bbook');
@@ -98,43 +92,43 @@ export class IBTradeHistory {
       return Number(commissionMap['*']?.usdPerLot || 0);
     };
 
-    // Determine commission rate once for the batch (groupId is account-level)
     let usdPerLot = resolveUsdPerLot(groupId);
+    console.log(`[UPSERT] Processing ${trades.length} trades for account ${accountId}, usdPerLot=${usdPerLot}, groupId=${groupId}`);
 
     for (const trade of trades) {
       try {
-        // Basic validation
         const orderId = String(trade?.OrderId ?? '');
-        if (!orderId) continue;
+        if (!orderId) { skipped.noOrderId++; continue; }
         
-        // Must have a valid trading symbol
         const symbol = String(trade?.Symbol || '').trim();
-        if (!symbol) continue;
+        if (!symbol) { skipped.noSymbol++; continue; }
         
-        // Only include actual trading positions (buy/sell) - exclude balance, deposit, withdrawal, etc.
         const orderType = String(trade?.OrderType || '').toLowerCase().trim();
-        if (orderType !== 'buy' && orderType !== 'sell') continue;
+        if (orderType !== 'buy' && orderType !== 'sell') { skipped.notBuySell++; continue; }
         
-        // Only include closed positions (must have ClosePrice and it must not be 0)
+        const entry = String(trade?.Entry || trade?.EntryType || trade?.DealEntry || '').toLowerCase();
+        const hasCloseTime = Boolean(
+          trade?.CloseTime || trade?.ClosedTime || trade?.CloseDate || trade?.Closed ||
+          trade?.TimeClose || trade?.DoneTime || trade?.DealTime || trade?.CloseTimeMsc || 
+          trade?.CloseTimeMS || trade?.CloseTimeMs || trade?.ClosedAt || trade?.Time
+        );
         const closePrice = Number(trade?.ClosePrice || 0);
-        if (!closePrice || closePrice === 0) continue;
-        
-        // Must have OpenPrice
         const openPrice = Number(trade?.OpenPrice || 0);
-        if (!openPrice || openPrice === 0) continue;
         
-        // Must have valid volume
+        const isClosedByEntry = entry.includes('out') || entry.includes('close');
+        const isClosedByFields = (closePrice > 0 || hasCloseTime) && openPrice > 0;
+        const isClosed = isClosedByEntry || isClosedByFields;
+        
+        if (!isClosed) { skipped.notClosed++; continue; }
+        
         const volume = Number(trade?.Volume || 0);
-        if (!volume || volume === 0) continue;
+        if (!volume || volume === 0) { skipped.noVolume++; continue; }
         
-        // Allow zero-profit trades so history shows all closed deals
         const profit = Number(trade?.Profit || 0);
-
         const id = `${accountId}-${orderId}`;
-        // MT5 returns volume in different formats - convert to standard lots
-        // If volume < 0.1, it's likely in mini/micro lots, multiply by 1000
         const volumeLots = volume < 0.1 ? volume * 1000 : volume;
         const ibCommission = volumeLots * usdPerLot;
+        const finalClosePrice = closePrice > 0 ? closePrice : openPrice;
 
         const queryText = `
           INSERT INTO ib_trade_history (
@@ -166,7 +160,7 @@ export class IBTradeHistory {
           orderType,
           volumeLots,
           openPrice,
-          closePrice,
+          finalClosePrice,
           profit,
           Number(trade.TakeProfit || 0),
           Number(trade.StopLoss || 0),
@@ -176,18 +170,18 @@ export class IBTradeHistory {
 
         saved.push(result.rows[0]);
       } catch (error) {
-        console.error('upsertTrades error:', error.message);
+        console.error(`[UPSERT] Error on trade ${trade?.OrderId}:`, error.message);
+        skipped.errors++;
       }
     }
 
+    console.log(`[UPSERT] Saved ${saved.length}/${trades.length}. Skipped: notClosed=${skipped.notClosed}, notBuySell=${skipped.notBuySell}, noVolume=${skipped.noVolume}, errors=${skipped.errors}`);
     return saved;
   }
 
-  // Paginated trades for a user/account used by admin route
   static async getTrades({ userId, accountId = null, groupId = null, limit = 50, offset = 0 }) {
     const params = [userId];
-    // Only closed OUT deals: must have a close price and a realized P&L (profit != 0)
-    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0';
+    let where = 'user_id = $1 AND close_price IS NOT NULL AND close_price > 0';
     if (accountId) {
       params.push(String(accountId));
       where += ` AND account_id = $${params.length}`;
@@ -230,7 +224,6 @@ export class IBTradeHistory {
     };
   }
 
-  // Aggregated stats per account for a user
   static async getAccountStats(userId) {
     const queryText = `
       SELECT 
@@ -240,7 +233,7 @@ export class IBTradeHistory {
         COALESCE(SUM(profit), 0) AS total_profit,
         COALESCE(SUM(ib_commission), 0) AS total_ib_commission
       FROM ib_trade_history
-      WHERE user_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+      WHERE user_id = $1 AND close_price IS NOT NULL AND close_price > 0
       GROUP BY account_id
       ORDER BY account_id
     `;
@@ -254,40 +247,37 @@ export class IBTradeHistory {
     
     for (const trade of trades) {
       try {
-        // Skip if no valid order ID
         const orderId = String(trade?.OrderId ?? '');
-        if (!orderId || orderId === 'undefined' || orderId === 'null') {
-          continue;
-        }
+        if (!orderId || orderId === 'undefined' || orderId === 'null') continue;
         
-        // Must have a valid trading symbol
         const symbol = String(trade?.Symbol || '').trim();
         if (!symbol) continue;
         
-        // Only include actual trading positions (buy/sell) - exclude balance, deposit, withdrawal, etc.
         const orderType = String(trade?.OrderType || '').toLowerCase().trim();
         if (orderType !== 'buy' && orderType !== 'sell') continue;
         
-        // Only include closed positions (must have ClosePrice and it must not be 0)
+        const entry = String(trade?.Entry || trade?.EntryType || trade?.DealEntry || '').toLowerCase();
+        const hasCloseTime = Boolean(
+          trade?.CloseTime || trade?.ClosedTime || trade?.CloseDate || trade?.Closed ||
+          trade?.TimeClose || trade?.DoneTime || trade?.DealTime || trade?.CloseTimeMsc || 
+          trade?.CloseTimeMS || trade?.CloseTimeMs || trade?.ClosedAt || trade?.Time
+        );
         const closePrice = Number(trade?.ClosePrice || 0);
-        if (!closePrice || closePrice === 0) continue;
-        
-        // Must have OpenPrice
         const openPrice = Number(trade?.OpenPrice || 0);
-        if (!openPrice || openPrice === 0) continue;
         
-        // Must have valid volume
+        const isClosedByEntry = entry.includes('out') || entry.includes('close');
+        const isClosedByFields = (closePrice > 0 || hasCloseTime) && openPrice > 0;
+        const isClosed = isClosedByEntry || isClosedByFields;
+        
+        if (!isClosed) continue;
+        
         const volume = Number(trade?.Volume || 0);
         if (!volume || volume === 0) continue;
         
-        // CRITICAL: Only include trades with non-zero profit (actual closed positions with P&L)
-        // Trades with $0.00 profit are opening legs or adjustments, not closed positions
         const profit = Number(trade?.Profit || 0);
-        if (profit === 0) continue;
-        
         const id = `${accountId}-${orderId}`;
-        // MT5 returns volume in different formats - convert to standard lots
         const volumeLots = volume < 0.1 ? volume * 1000 : volume;
+        const finalClosePrice = closePrice > 0 ? closePrice : openPrice;
         
         const insertQuery = `
           INSERT INTO ib_trade_history (
@@ -314,7 +304,7 @@ export class IBTradeHistory {
           orderType,
           volumeLots,
           openPrice,
-          closePrice,
+          finalClosePrice,
           profit,
           Number(trade.TakeProfit || 0),
           Number(trade.StopLoss || 0)
@@ -331,7 +321,6 @@ export class IBTradeHistory {
 
   static async calculateIBCommissions(accountId, ibRequestId) {
     try {
-      // Calculate commission per trade using the assigned group's USD/lot when available
       const updateQuery = `
         UPDATE ib_trade_history AS t
         SET ib_commission = (t.volume_lots * COALESCE(a.usd_per_lot, s.usd_per_lot, 0)),
@@ -343,19 +332,17 @@ export class IBTradeHistory {
         )
         WHERE t.account_id = $1
           AND t.ib_request_id = $2
-          AND t.close_price IS NOT NULL AND t.close_price != 0
+          AND t.close_price IS NOT NULL AND t.close_price > 0
           AND a.ib_request_id = $2
           AND (
             lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_id, '')) OR
             lower(COALESCE(t.group_id, '')) = lower(COALESCE(a.group_name, '')) OR
-            regexp_replace(lower(COALESCE(t.group_id,'')), '.*[\\\\/]', '') = regexp_replace(lower(COALESCE(a.group_id,'')), '.*[\\\\/]', '')
+            regexp_replace(lower(COALESCE(t.group_id,'')), '.*[\\\/]', '') = regexp_replace(lower(COALESCE(a.group_id,'')), '.*[\\\/]', '')
           )
         RETURNING t.*;
       `;
       const result = await query(updateQuery, [String(accountId), ibRequestId]);
 
-      // Fallback: if some rows still have 0 commission (no group match), use the
-      // highest configured USD/lot for this IB as a default to avoid zeros.
       const fallbackRateRes = await query(
         `SELECT COALESCE(MAX(COALESCE(a.usd_per_lot, s.usd_per_lot)), 0) AS usd_per_lot
          FROM ib_group_assignments a
@@ -369,7 +356,7 @@ export class IBTradeHistory {
           `UPDATE ib_trade_history
            SET ib_commission = (volume_lots * $1::numeric), updated_at = CURRENT_TIMESTAMP
            WHERE ib_request_id = $2 AND account_id = $3
-             AND close_price IS NOT NULL AND close_price != 0
+             AND close_price IS NOT NULL AND close_price > 0
              AND COALESCE(ib_commission,0) = 0`,
           [fallbackUsdPerLot, ibRequestId, String(accountId)]
         );
@@ -385,7 +372,7 @@ export class IBTradeHistory {
   static async getTradesByIB(ibRequestId, accountId = null) {
     let queryText = `
       SELECT * FROM ib_trade_history
-      WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+      WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price > 0
     `;
     const params = [ibRequestId];
     
@@ -408,7 +395,7 @@ export class IBTradeHistory {
         SUM(profit) as total_profit,
         SUM(ib_commission) as total_ib_commission
       FROM ib_trade_history
-      WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+      WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price > 0
     `;
     const params = [ibRequestId];
     

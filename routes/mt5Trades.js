@@ -12,9 +12,12 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
     const { accountId } = req.params;
     const { fromDate, toDate, ibRequestId } = req.body;
     
-    // Default date range: last 90 days
-    const to = toDate || new Date().toISOString();
-    const from = fromDate || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    // Use wide date range to capture all trades
+    const to = toDate || '2085-12-31';
+    const from = fromDate || '2024-01-01';
+    
+    console.log(`[SYNC] Starting sync for account ${accountId}, IB Request ${ibRequestId}`);
+    console.log(`[SYNC] Date range: ${from} to ${to}`);
     
     // Get userId for this account
     const accountResult = await query(
@@ -105,7 +108,13 @@ router.post('/sync/:accountId', authenticateAdminToken, async (req, res) => {
     } catch {}
 
     // Save trades to database with commission map
+    console.log(`[SYNC] Fetched ${trades.length} trades from MT5 API`);
+    console.log(`[SYNC] Commission map:`, commissionMap);
+    console.log(`[SYNC] Group ID: ${groupId}`);
+    
     const savedTrades = await IBTradeHistory.upsertTrades(trades, { accountId, userId, ibRequestId, commissionMap, groupId });
+    
+    console.log(`[SYNC] Saved ${savedTrades.length} trades to database`);
     
     res.json({
       success: true,
