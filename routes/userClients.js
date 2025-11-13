@@ -31,6 +31,7 @@ router.get('/', authenticateToken, async (req, res) => {
 
     // Get clients referred by this IB (from ib_requests.referred_by)
     // Include all referral details from database
+    // Only count trades from referred users, excluding IB's own trades
     const clientsResult = await query(`
       SELECT 
         ib.id as ib_id,
@@ -44,17 +45,21 @@ router.get('/', authenticateToken, async (req, res) => {
         ib.referred_by,
         ib.usd_per_lot,
         ib.spread_percentage_per_lot,
-        COALESCE(SUM(th.volume_lots), 0) as direct_volume_lots,
-        COALESCE(SUM(th.ib_commission), 0) as direct_commission,
+        COALESCE(SUM(CASE WHEN th.user_id = u.id 
+                          AND th.close_price IS NOT NULL 
+                          AND th.close_price != 0 
+                          AND th.profit != 0 
+                     THEN th.volume_lots ELSE 0 END), 0) as direct_volume_lots,
+        COALESCE(SUM(CASE WHEN th.user_id = u.id 
+                          AND th.close_price IS NOT NULL 
+                          AND th.close_price != 0 
+                          AND th.profit != 0 
+                     THEN th.ib_commission ELSE 0 END), 0) as direct_commission,
         COUNT(DISTINCT CASE WHEN ma."accountType" = 'real' THEN ma."accountId" END) as account_count
       FROM ib_requests ib
       LEFT JOIN "User" u ON u.email = ib.email
       LEFT JOIN "MT5Account" ma ON ma."userId" = u.id
-      LEFT JOIN ib_trade_history th ON th.ib_request_id = ib.id
-        AND th.close_price IS NOT NULL 
-        AND th.close_price != 0
-        AND th.profit IS NOT NULL
-        AND th.profit != 0
+      LEFT JOIN ib_trade_history th ON th.user_id = u.id AND th.ib_request_id = $1
       WHERE ib.referred_by = $1
       GROUP BY ib.id, ib.full_name, ib.email, ib.submitted_at, ib.approved_at, 
                ib.ib_type, ib.status, ib.referral_code, ib.referred_by, 
@@ -137,12 +142,34 @@ router.get('/', authenticateToken, async (req, res) => {
     }
 
     // Get last trade date for each client
+    // Get IB's user_id to exclude from last trade query
+    const ibUserResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [currentIB?.email]);
+    const ibUserId = ibUserResult.rows[0]?.id ? String(ibUserResult.rows[0].id) : null;
+    
     for (const client of clients) {
-      const lastTradeResult = await query(`
+      // Get user_id for this client
+      const clientUserResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [client.email]);
+      if (clientUserResult.rows.length === 0) continue;
+      const clientUserId = String(clientUserResult.rows[0].id);
+      
+      // Only get trades from this client (referred user), excluding IB's own trades
+      let lastTradeQuery = `
         SELECT MAX(synced_at) as last_trade
         FROM ib_trade_history
         WHERE ib_request_id = $1
-      `, [client.userId]);
+          AND user_id = $2
+          AND close_price IS NOT NULL 
+          AND close_price != 0 
+          AND profit != 0
+      `;
+      const lastTradeParams = [ibRequestId, clientUserId];
+      
+      if (ibUserId && ibUserId !== clientUserId) {
+        lastTradeQuery += ` AND user_id != $3`;
+        lastTradeParams.push(ibUserId);
+      }
+      
+      const lastTradeResult = await query(lastTradeQuery, lastTradeParams);
 
       if (lastTradeResult.rows[0]?.last_trade) {
         client.lastTrade = lastTradeResult.rows[0].last_trade;
