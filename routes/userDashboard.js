@@ -41,11 +41,124 @@ router.get('/', authenticateToken, async (req, res) => {
       [ib.id]
     );
     
-    // Use same earning logic as Overview/Analytics (approved groups + real accounts)
-    const summary = await IBWithdrawal.getSummary(ib.id, { periodDays: Number(process.env.DASHBOARD_PERIOD_DAYS || 30) });
-    const balance = Number(summary?.totalEarned || 0);
-    const fixedCommission = Number(summary?.fixedEarned || 0);
-    const spreadCommission = Number(summary?.spreadEarned || 0);
+    // Helper: Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Helper: Get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Get IB's own user_id to exclude
+    const ibUserId = await getIBUserId(ib.id);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(ib.id);
+
+    // Calculate commission from referred users' trades only (excluding IB's own trades)
+    let balance = 0;
+    let fixedCommission = 0;
+    let spreadCommission = 0;
+
+    if (referredUserIds.length > 0) {
+      // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+      let userFilter = '';
+      const params = [ib.id];
+      if (ibUserId) {
+        params.push(ibUserId);
+        userFilter = `AND user_id != $${params.length}`;
+      }
+      params.push(referredUserIds);
+      const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
+      // Get approved groups map for spread calculation
+      const normalize = (gid) => {
+        if (!gid) return '';
+        const s = String(gid).toLowerCase().trim();
+        const parts = s.split(/[\\/]/);
+        return parts[parts.length - 1] || s;
+      };
+      const approvedMap = new Map();
+      for (const row of groupsResult.rows) {
+        const keys = [
+          String(row.group_id || '').toLowerCase(),
+          String(row.group_name || '').toLowerCase(),
+          normalize(row.group_id)
+        ].filter(k => k);
+        for (const k of keys) {
+          approvedMap.set(k, {
+            spreadSharePercentage: Number(row.spread_share_percentage || 0),
+            usdPerLot: Number(row.usd_per_lot || 0)
+          });
+        }
+      }
+
+      // Fetch trades from referred users only
+      const tradesRes = await query(
+        `SELECT 
+           group_id,
+           COALESCE(SUM(volume_lots), 0) AS total_volume_lots,
+           COALESCE(SUM(ib_commission), 0) AS total_ib_commission
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 
+           AND close_price IS NOT NULL 
+           AND close_price != 0 
+           AND profit != 0
+           ${userFilter}
+           ${userInClause}
+         GROUP BY group_id`,
+        params
+      );
+
+      // Calculate fixed and spread commission
+      for (const row of tradesRes.rows) {
+        const groupId = row.group_id || '';
+        const normGroup = normalize(groupId);
+        const assignment = approvedMap.get(normGroup) || approvedMap.get(String(groupId).toLowerCase()) || { spreadSharePercentage: 0, usdPerLot: 0 };
+        
+        const lots = Number(row.total_volume_lots || 0);
+        const fixed = Number(row.total_ib_commission || 0);
+        const spread = lots * (assignment.spreadSharePercentage / 100);
+        
+        fixedCommission += fixed;
+        spreadCommission += spread;
+      }
+    }
+
+    balance = fixedCommission + spreadCommission;
     
     // Get referral link
     const referralLink = ib.referral_code 

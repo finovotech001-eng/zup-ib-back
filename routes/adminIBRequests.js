@@ -1500,10 +1500,35 @@ router.get('/profiles/:id/all-accounts', authenticateAdminToken, async (req, res
     }
 
     // Get trading stats for all accounts first (faster, doesn't require API)
+    // Only count trades from referred users, excluding IB's own trades
     const statsMap = new Map();
     const accountIds = accountsRes.rows.map(r => String(r.accountId));
     
+    // Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const ibUserId = await getIBUserId(id);
+    
     if (accountIds.length > 0) {
+      // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+      let userFilter = '';
+      const params = [id, accountIds];
+      if (ibUserId) {
+        params.push(ibUserId);
+        userFilter = `AND user_id != $${params.length}`;
+      }
+      params.push(referredUserIds);
+      const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
       const statsRes = await query(
         `SELECT 
            account_id,
@@ -1516,10 +1541,17 @@ router.get('/profiles/:id/all-accounts', authenticateAdminToken, async (req, res
            AND close_price IS NOT NULL 
            AND close_price != 0 
            AND profit != 0
+           ${userFilter}
+           ${userInClause}
          GROUP BY account_id`,
-        [id, accountIds]
+        params
       );
 
+      console.log(`[All Accounts] Query returned ${statsRes.rows.length} account stats`);
+      console.log(`[All Accounts] Account IDs being queried:`, accountIds.slice(0, 5));
+      console.log(`[All Accounts] Referred user IDs:`, referredUserIds);
+      console.log(`[All Accounts] IB user ID (to exclude):`, ibUserId);
+      
       for (const row of statsRes.rows) {
         const accountIdStr = String(row.account_id);
         const volumeLots = Number(row.total_volume_lots || 0);
@@ -1529,6 +1561,12 @@ router.get('/profiles/:id/all-accounts', authenticateAdminToken, async (req, res
           lastTradingDate: row.last_trading_date || null
         });
         console.log(`[All Accounts] Stats for account ${accountIdStr}: volumeLots=${volumeLots}, profit=${Number(row.total_profit || 0)}`);
+      }
+      
+      // Log accounts that didn't get stats
+      const accountsWithoutStats = accountIds.filter(accId => !statsMap.has(accId));
+      if (accountsWithoutStats.length > 0) {
+        console.log(`[All Accounts] WARNING: ${accountsWithoutStats.length} accounts have no stats:`, accountsWithoutStats.slice(0, 5));
       }
     }
 
