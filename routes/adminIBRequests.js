@@ -7,6 +7,7 @@ import { IBTradeHistory } from '../models/IBTradeHistory.js';
 // import { IBLevelUpHistory } from '../models/IBLevelUpHistory.js'; // File removed
  import { authenticateAdminToken } from './adminAuth.js';
  import { query } from '../config/database.js';
+import { IBCommission } from '../models/IBCommission.js';
 
 const router = express.Router();
 const ALLOWED_IB_TYPES = IB_REQUEST_TYPE_VALUES;
@@ -1724,6 +1725,236 @@ router.get('/profiles/:id/all-accounts', authenticateAdminToken, async (req, res
       success: false,
       message: 'Unable to fetch accounts',
       error: process.env.NODE_ENV !== 'production' ? error.message : undefined
+    });
+  }
+});
+
+// POST /api/admin/ib-requests/profiles/:id/sync-commission - Sync and save commission to database
+router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
+
+    // Get IB details
+    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [id]);
+    if (ibResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'IB profile not found' });
+    }
+
+    const ibEmail = ibResult.rows[0].email;
+
+    // Helper: Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Helper: Get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Get commission structures (groups)
+    const groupsResult = await query(
+      `SELECT group_id, group_name, structure_name, usd_per_lot, spread_share_percentage
+       FROM ib_group_assignments
+       WHERE ib_request_id = $1`,
+      [id]
+    );
+
+    // Get IB's user_id for ib_commission table
+    const ibUserResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ibEmail]);
+    const ibUserId = ibUserResult.rows[0]?.id ? String(ibUserResult.rows[0].id) : null;
+
+    // Get IB's own user_id to exclude
+    const ibUserIdForExclusion = await getIBUserId(id);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(id);
+
+    console.log(`[Sync Commission] IB ID: ${id}, IB Email: ${ibEmail}`);
+    console.log(`[Sync Commission] IB User ID (to exclude): ${ibUserIdForExclusion}`);
+    console.log(`[Sync Commission] Referred User IDs (${referredUserIds.length}):`, referredUserIds);
+    console.log(`[Sync Commission] Commission Groups (${groupsResult.rows.length}):`, groupsResult.rows.map(r => ({ group_id: r.group_id, spread: r.spread_share_percentage })));
+
+    // Calculate commission, trades, and lots from referred users' trades only (excluding IB's own trades)
+    let balance = 0;
+    let fixedCommission = 0;
+    let spreadCommission = 0;
+    let totalTrades = 0;
+    let totalLots = 0;
+
+    if (referredUserIds.length > 0) {
+      // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+      let userFilter = '';
+      const params = [id];
+      if (ibUserIdForExclusion) {
+        params.push(ibUserIdForExclusion);
+        userFilter = `AND user_id != $${params.length}`;
+      }
+      params.push(referredUserIds);
+      const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
+      // Get approved groups map for spread calculation
+      const normalize = (gid) => {
+        if (!gid) return '';
+        const s = String(gid).toLowerCase().trim();
+        const parts = s.split(/[\\/]/);
+        return parts[parts.length - 1] || s;
+      };
+      const approvedMap = new Map();
+      for (const row of groupsResult.rows) {
+        const keys = [
+          String(row.group_id || '').toLowerCase(),
+          String(row.group_name || '').toLowerCase(),
+          normalize(row.group_id)
+        ].filter(k => k);
+        for (const k of keys) {
+          approvedMap.set(k, {
+            spreadSharePercentage: Number(row.spread_share_percentage || 0),
+            usdPerLot: Number(row.usd_per_lot || 0)
+          });
+        }
+      }
+
+      // Get total trades count and total lots in one query
+      const statsRes = await query(
+        `SELECT 
+           COUNT(*)::int AS total_trades,
+           COALESCE(SUM(volume_lots), 0) AS total_lots
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 
+           AND close_price IS NOT NULL 
+           AND close_price != 0 
+           AND profit != 0
+           ${userFilter}
+           ${userInClause}`,
+        params
+      );
+
+      totalTrades = Number(statsRes.rows[0]?.total_trades || 0);
+      totalLots = Number(statsRes.rows[0]?.total_lots || 0);
+      
+      console.log(`[Sync Commission] Total trades: ${totalTrades}, Total lots: ${totalLots}`);
+
+      // Get commission by group for calculation
+      const tradesRes = await query(
+        `SELECT 
+           group_id,
+           COALESCE(SUM(volume_lots), 0) AS total_volume_lots,
+           COALESCE(SUM(ib_commission), 0) AS total_ib_commission
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 
+           AND close_price IS NOT NULL 
+           AND close_price != 0 
+           AND profit != 0
+           ${userFilter}
+           ${userInClause}
+         GROUP BY group_id`,
+        params
+      );
+
+      console.log(`[Sync Commission] Trades query returned ${tradesRes.rows.length} groups`);
+
+      // Calculate total commission (fixed + spread)
+      for (const row of tradesRes.rows) {
+        const groupId = row.group_id || '';
+        const normGroup = normalize(groupId);
+        const assignment = approvedMap.get(normGroup) || approvedMap.get(String(groupId).toLowerCase()) || { spreadSharePercentage: 0, usdPerLot: 0 };
+        
+        const lots = Number(row.total_volume_lots || 0);
+        const fixed = Number(row.total_ib_commission || 0);
+        const spread = lots * (assignment.spreadSharePercentage / 100);
+        
+        fixedCommission += fixed;
+        spreadCommission += spread;
+      }
+      
+      balance = fixedCommission + spreadCommission;
+    } else {
+      console.log(`[Sync Commission] WARNING: No referred users found for IB ${id}`);
+    }
+
+    console.log(`[Sync Commission] Final calculation: total_commission=${balance}, total_trades=${totalTrades}, total_lots=${totalLots}`);
+
+    // Save/update commission in ib_commission table
+    if (ibUserId) {
+      try {
+        console.log(`[Sync Commission] Saving to database: ib_request_id=${id}, user_id=${ibUserId}, total_commission=${balance}, total_trades=${totalTrades}, total_lots=${totalLots}`);
+        await IBCommission.upsertCommission(id, ibUserId, {
+          totalCommission: balance,
+          totalTrades: totalTrades,
+          totalLots: totalLots
+        });
+        console.log(`[Sync Commission] Successfully saved to database`);
+      } catch (error) {
+        console.error('Error saving commission to ib_commission table:', error);
+        console.error('Error stack:', error.stack);
+        return res.status(500).json({
+          success: false,
+          message: 'Error saving commission data',
+          error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined,
+          details: process.env.NODE_ENV !== 'production' ? error.stack : undefined
+        });
+      }
+    } else {
+      console.log(`[Sync Commission] WARNING: IB user not found in User table for email ${ibEmail}`);
+      return res.status(404).json({
+        success: false,
+        message: 'IB user not found in User table'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Commission synced and saved successfully',
+      data: {
+        totalCommission: balance,
+        totalTrades: totalTrades,
+        totalLots: totalLots
+      }
+    });
+  } catch (error) {
+    console.error('Error syncing commission:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to sync commission',
+      error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined,
+      details: process.env.NODE_ENV !== 'production' ? error.stack : undefined
     });
   }
 });
