@@ -1060,6 +1060,636 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
   }
 });
 
+// Get referred users for an IB
+router.get('/profiles/:id/referred-users', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
+
+    // Get users from ib_referrals
+    const refRes = await query(
+      `SELECT r.id as ref_id, r.user_id, r.email, r.created_at as join_date, r.source
+       FROM ib_referrals r
+       WHERE r.ib_request_id = $1
+       ORDER BY r.created_at DESC`,
+      [id]
+    );
+
+    // Get users from ib_requests where referred_by = id
+    const ibRefRes = await query(
+      `SELECT ir.id as ib_id, u.id as user_id, ir.email, ir.full_name, ir.submitted_at as join_date, 
+              ir.status, ir.ib_type, 'ib_request' as source
+       FROM ib_requests ir
+       JOIN "User" u ON u.email = ir.email
+       WHERE ir.referred_by = $1 AND u.id IS NOT NULL
+       ORDER BY ir.submitted_at DESC`,
+      [id]
+    );
+
+    // Combine and deduplicate by user_id
+    const userMap = new Map();
+    
+    // Add ib_referrals users
+    for (const row of refRes.rows) {
+      const userId = row.user_id ? String(row.user_id) : null;
+      if (userId && !userMap.has(userId)) {
+        userMap.set(userId, {
+          userId,
+          email: row.email,
+          name: null,
+          joinDate: row.join_date,
+          source: row.source || 'crm',
+          status: 'active',
+          ibType: null
+        });
+      }
+    }
+
+    // Add ib_requests users (may override if duplicate)
+    for (const row of ibRefRes.rows) {
+      const userId = row.user_id ? String(row.user_id) : null;
+      if (userId) {
+        userMap.set(userId, {
+          userId,
+          email: row.email,
+          name: row.full_name,
+          joinDate: row.submitted_at,
+          source: 'ib_request',
+          status: row.status,
+          ibType: row.ib_type
+        });
+      }
+    }
+
+    // Get stats for each user
+    const usersWithStats = await Promise.all(
+      Array.from(userMap.values()).map(async (user) => {
+        // Count MT5 accounts
+        let accountCount = 0;
+        try {
+          const accRes = await query(
+            'SELECT COUNT(*)::int AS cnt FROM "MT5Account" WHERE "userId" = $1',
+            [user.userId]
+          );
+          accountCount = Number(accRes.rows[0]?.cnt || 0);
+        } catch {}
+
+        // Get trading stats from ib_trade_history (only closed trades - deals out)
+        // Only count trades with profit != 0 (closed trades) to match trade history display
+        let totalVolume = 0;
+        let totalCommission = 0;
+        let tradeCount = 0;
+        try {
+          const statsRes = await query(
+            `SELECT 
+               COALESCE(SUM(volume_lots), 0) AS total_volume,
+               COALESCE(SUM(ib_commission), 0) AS total_commission,
+               COUNT(*)::int AS trade_count
+             FROM ib_trade_history
+             WHERE ib_request_id = $1 
+               AND user_id = $2
+               AND close_price IS NOT NULL 
+               AND close_price != 0 
+               AND profit != 0`,
+            [id, user.userId]
+          );
+          if (statsRes.rows.length > 0) {
+            totalVolume = Number(statsRes.rows[0].total_volume || 0);
+            totalCommission = Number(statsRes.rows[0].total_commission || 0);
+            tradeCount = Number(statsRes.rows[0].trade_count || 0);
+          }
+        } catch {}
+
+        // Determine if active (has trades or accounts)
+        const isActive = accountCount > 0 || tradeCount > 0;
+
+        return {
+          ...user,
+          accountCount,
+          totalVolume,
+          totalCommission,
+          tradeCount,
+          isActive
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      data: {
+        users: usersWithStats,
+        total: usersWithStats.length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching referred users:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to fetch referred users'
+    });
+  }
+});
+
+// Get MT5 accounts for a specific user under an IB
+router.get('/profiles/:ibId/user/:userId/accounts', authenticateAdminToken, async (req, res) => {
+  try {
+    const { ibId: rawIbId, userId } = req.params;
+    const ibId = Number.parseInt(String(rawIbId), 10);
+    if (!Number.isFinite(ibId) || !userId) {
+      return res.status(400).json({ success: false, message: 'Invalid parameters' });
+    }
+
+    // Verify user is referred by this IB
+    const verifyRes = await query(
+      `SELECT 1 FROM ib_referrals WHERE ib_request_id = $1 AND user_id = $2
+       UNION
+       SELECT 1 FROM ib_requests ir 
+       JOIN "User" u ON u.email = ir.email 
+       WHERE ir.referred_by = $1 AND u.id::text = $2`,
+      [ibId, String(userId)]
+    );
+
+    if (verifyRes.rows.length === 0) {
+      return res.status(403).json({ success: false, message: 'User is not referred by this IB' });
+    }
+
+    // Get all MT5 accounts for this user
+    const accountsResult = await query(
+      'SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1',
+      [userId]
+    );
+
+    // Fetch account details from MT5 API
+    const fetchAccount = async (accountId) => {
+      try {
+        // Fetch balance, equity, profit from getClientBalance API
+        let balance = 0;
+        let equity = 0;
+        let profit = 0;
+        let margin = 0;
+        let marginFree = 0;
+
+        try {
+          const balanceController = new AbortController();
+          const balanceTimeout = setTimeout(() => balanceController.abort(), 5000);
+          const balanceResponse = await fetch(
+            `http://18.175.242.21:5003/api/Users/${accountId}/getClientBalance`,
+            { headers: { accept: '*/*' }, signal: balanceController.signal }
+          );
+          clearTimeout(balanceTimeout);
+
+          if (balanceResponse.ok) {
+            const balanceData = await balanceResponse.json();
+            console.log(`[User Accounts] Balance API response for ${accountId}:`, JSON.stringify(balanceData).substring(0, 400));
+            // Response structure: { Success: true, Data: { Balance, Equity, Profit, Margin, MarginFree, ... } }
+            const dataObj = balanceData?.Data || balanceData?.data || balanceData;
+            if (dataObj) {
+              // Try multiple possible field name variations
+              balance = Number(dataObj.Balance ?? dataObj.balance ?? 0);
+              equity = Number(dataObj.Equity ?? dataObj.equity ?? 0);
+              profit = Number(dataObj.Profit ?? dataObj.profit ?? dataObj.Floating ?? dataObj.floating ?? 0);
+              margin = Number(dataObj.Margin ?? dataObj.margin ?? 0);
+              marginFree = Number(dataObj.MarginFree ?? dataObj.marginFree ?? dataObj.MarginFree ?? 0);
+              console.log(`[User Accounts] Parsed values for ${accountId}: balance=${balance}, equity=${equity}, profit=${profit}, margin=${margin}`);
+              console.log(`[User Accounts] Raw data keys:`, Object.keys(dataObj));
+            } else {
+              console.warn(`[User Accounts] No Data object found in response for ${accountId}:`, balanceData);
+            }
+          } else {
+            console.warn(`[User Accounts] Balance API returned status ${balanceResponse.status} for ${accountId}`);
+          }
+        } catch (error) {
+          console.error(`[User Accounts] Error fetching balance for account ${accountId}:`, error.message);
+        }
+
+        // Fetch profile for group name and demo check
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        const response = await fetch(
+          `http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`,
+          { headers: { accept: '*/*' }, signal: controller.signal }
+        );
+        clearTimeout(timeout);
+
+        if (!response.ok) return null;
+        const data = await response.json();
+        const payload = data?.Data || data?.data;
+        if (!payload) return null;
+
+        const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? null;
+        const groupIdFull = payload?.Group || payload?.group || '';
+        const isDemo = 
+          (accountType && String(accountType).toLowerCase().includes('demo')) ||
+          (groupIdFull && String(groupIdFull).toLowerCase().includes('demo'));
+
+        let groupName = payload?.Group ?? payload?.group ?? payload?.GroupName ?? payload?.group_name ?? 'Unknown';
+        if (typeof groupName === 'string') {
+          const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
+          if (match && match[1]) {
+            groupName = match[1];
+          } else if (groupName.includes('\\')) {
+            const parts = groupName.split('\\');
+            groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+          } else if (groupName.includes('/')) {
+            const parts = groupName.split('/');
+            groupName = parts[parts.length - 1];
+          }
+        }
+
+        // Get commission structure for this account
+        const commissionRes = await query(
+          `SELECT structure_name, usd_per_lot, spread_share_percentage
+           FROM ib_group_assignments
+           WHERE ib_request_id = $1 AND group_id = $2`,
+          [ibId, groupIdFull]
+        );
+
+        // Get trade stats for this account - only closed trades (deals out) with profit != 0
+        const tradeStatsRes = await query(
+          `SELECT 
+             COALESCE(SUM(volume_lots), 0) AS total_volume,
+             COALESCE(SUM(ib_commission), 0) AS total_commission,
+             COALESCE(SUM(profit), 0) AS total_profit,
+             COUNT(*)::int AS trade_count
+           FROM ib_trade_history
+           WHERE ib_request_id = $1 
+             AND account_id = $2
+             AND close_price IS NOT NULL 
+             AND close_price != 0 
+             AND profit != 0`,
+          [ibId, String(accountId)]
+        );
+
+        const tradeStats = tradeStatsRes.rows[0] || {};
+        const commissionInfo = commissionRes.rows[0] || {};
+        
+        // If profit from API is 0, use profit from trade history
+        const finalProfit = profit !== 0 ? profit : Number(tradeStats.total_profit || 0);
+        
+        // If margin is 0, calculate from equity and balance (margin = balance - equity + profit, or use marginFree)
+        const finalMargin = margin !== 0 ? margin : (balance - equity + finalProfit);
+
+        return {
+          accountId,
+          balance: balance, // From getClientBalance API
+          equity: equity, // From getClientBalance API
+          margin: finalMargin, // From getClientBalance API or calculated
+          profit: finalProfit, // From getClientBalance API or trade history
+          marginFree: marginFree, // From getClientBalance API
+          group: groupName,
+          groupId: groupIdFull,
+          accountType: accountType || (isDemo ? 'Demo' : 'Live'),
+          isDemo,
+          isEligibleForCommission: commissionRes.rows.length > 0,
+          commissionStructure: commissionInfo.structure_name || null,
+          usdPerLot: Number(commissionInfo.usd_per_lot || 0),
+          spreadSharePercentage: Number(commissionInfo.spread_share_percentage || 0),
+          totalVolume: Number(tradeStats.total_volume || 0),
+          totalCommission: Number(tradeStats.total_commission || 0),
+          tradeCount: Number(tradeStats.trade_count || 0)
+        };
+      } catch (error) {
+        console.error(`Error fetching account ${accountId}:`, error);
+        return null;
+      }
+    };
+
+    const accounts = await Promise.all(
+      accountsResult.rows.map(r => fetchAccount(r.accountId))
+    );
+
+    const validAccounts = accounts.filter(acc => acc !== null && !acc.isDemo);
+
+    res.json({
+      success: true,
+      data: {
+        accounts: validAccounts,
+        total: validAccounts.length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user accounts:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to fetch user accounts'
+    });
+  }
+});
+
+// Get all MT5 accounts from referred users (for client accounts table)
+router.get('/profiles/:id/all-accounts', authenticateAdminToken, async (req, res) => {
+  try {
+    const { id: rawId } = req.params;
+    const id = Number.parseInt(String(rawId), 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid IB profile id' });
+    }
+
+    // Get referred user_ids
+    const referredUserIds = [];
+    const userMap = new Map(); // userId -> { email, name, joinDate, partnerCode, country }
+
+    // From ib_referrals
+    let refRes;
+    try {
+      refRes = await query(
+        `SELECT r.user_id, r.email, r.created_at as join_date, r.referral_code as partner_code,
+                COALESCE(u.country, u.country_code, u.nationality, '-') as country
+         FROM ib_referrals r
+         LEFT JOIN "User" u ON u.id::text = r.user_id
+         WHERE r.ib_request_id = $1 AND r.user_id IS NOT NULL`,
+        [id]
+      );
+    } catch (err) {
+      // If COALESCE fails due to missing columns, try without it
+      console.warn('Error with COALESCE, trying simpler query:', err.message);
+      refRes = await query(
+        `SELECT r.user_id, r.email, r.created_at as join_date, r.referral_code as partner_code,
+                '-' as country
+         FROM ib_referrals r
+         WHERE r.ib_request_id = $1 AND r.user_id IS NOT NULL`,
+        [id]
+      );
+    }
+    for (const row of refRes.rows) {
+      const userId = String(row.user_id);
+      if (!userMap.has(userId)) {
+        referredUserIds.push(userId);
+        userMap.set(userId, {
+          email: row.email,
+          name: null,
+          joinDate: row.join_date,
+          partnerCode: row.partner_code || '-',
+          country: row.country || '-'
+        });
+      }
+    }
+
+    // From ib_requests where referred_by = id
+    let ibRefRes;
+    try {
+      ibRefRes = await query(
+        `SELECT u.id as user_id, ir.email, ir.full_name, ir.submitted_at as join_date, 
+                ir.referral_code as partner_code, 
+                COALESCE(u.country, u.country_code, u.nationality, '-') as country
+         FROM ib_requests ir
+         JOIN "User" u ON u.email = ir.email
+         WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+        [id]
+      );
+    } catch (err) {
+      // If COALESCE fails due to missing columns, try without it
+      console.warn('Error with COALESCE in ib_requests query, trying simpler query:', err.message);
+      ibRefRes = await query(
+        `SELECT u.id as user_id, ir.email, ir.full_name, ir.submitted_at as join_date, 
+                ir.referral_code as partner_code, 
+                '-' as country
+         FROM ib_requests ir
+         JOIN "User" u ON u.email = ir.email
+         WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+        [id]
+      );
+    }
+    for (const row of ibRefRes.rows) {
+      const userId = String(row.user_id);
+      if (!userMap.has(userId)) {
+        referredUserIds.push(userId);
+      }
+      userMap.set(userId, {
+        email: row.email,
+        name: row.full_name,
+        joinDate: row.submitted_at,
+        partnerCode: row.partner_code || '-',
+        country: row.country || '-'
+      });
+    }
+
+    if (referredUserIds.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          accounts: [],
+          total: 0
+        }
+      });
+    }
+
+    // Get all MT5 accounts for referred users
+    const accountsRes = await query(
+      `SELECT "accountId", "userId" 
+       FROM "MT5Account" 
+       WHERE "userId" = ANY($1::text[])`,
+      [referredUserIds]
+    );
+
+    console.log(`[All Accounts] Found ${accountsRes.rows.length} MT5 accounts for ${referredUserIds.length} referred users`);
+    console.log(`[All Accounts] Referred user IDs:`, referredUserIds);
+    console.log(`[All Accounts] Sample account rows:`, accountsRes.rows.slice(0, 3));
+
+    if (accountsRes.rows.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          accounts: [],
+          total: 0
+        }
+      });
+    }
+
+    // Get trading stats for all accounts first (faster, doesn't require API)
+    const statsMap = new Map();
+    const accountIds = accountsRes.rows.map(r => String(r.accountId));
+    
+    if (accountIds.length > 0) {
+      const statsRes = await query(
+        `SELECT 
+           account_id,
+           COALESCE(SUM(profit), 0) AS total_profit,
+           COALESCE(SUM(volume_lots), 0) AS total_volume_lots,
+           MAX(synced_at) AS last_trading_date
+         FROM ib_trade_history
+         WHERE ib_request_id = $1 
+           AND account_id = ANY($2::text[])
+           AND close_price IS NOT NULL 
+           AND close_price != 0 
+           AND profit != 0
+         GROUP BY account_id`,
+        [id, accountIds]
+      );
+
+      for (const row of statsRes.rows) {
+        const accountIdStr = String(row.account_id);
+        const volumeLots = Number(row.total_volume_lots || 0);
+        statsMap.set(accountIdStr, {
+          totalProfit: Number(row.total_profit || 0),
+          totalVolumeLots: volumeLots,
+          lastTradingDate: row.last_trading_date || null
+        });
+        console.log(`[All Accounts] Stats for account ${accountIdStr}: volumeLots=${volumeLots}, profit=${Number(row.total_profit || 0)}`);
+      }
+    }
+
+    // Fetch account details from MT5 API (optional, for group name and demo check)
+    const allAccounts = await Promise.all(
+      accountsRes.rows.map(async (row) => {
+        const accountId = row.accountId;
+        const userId = String(row.userId);
+        const userInfo = userMap.get(userId) || { email: '-', name: null, joinDate: null, partnerCode: '-', country: '-' };
+
+        // Get trading stats (already computed)
+        const stats = statsMap.get(String(accountId)) || {
+          totalProfit: 0,
+          totalVolumeLots: 0,
+          lastTradingDate: null
+        };
+
+        const totalProfitFromHistory = stats.totalProfit;
+        const totalVolumeLots = Number(stats.totalVolumeLots || 0);
+        // Convert lots to millions USD: 1 lot = 100,000 USD, so lots * 0.1 = millions USD
+        const totalVolumeMlnUSD = totalVolumeLots * 0.1;
+        const lastTradingDate = stats.lastTradingDate;
+        
+        console.log(`[All Accounts] Account ${accountId}: volumeLots=${totalVolumeLots}, volumeMlnUSD=${totalVolumeMlnUSD}`);
+
+        // Fetch balance, equity, and profit from MT5 API
+        let balance = 0;
+        let equity = 0;
+        let profit = 0;
+        let groupName = 'Standard';
+        let isDemo = false;
+
+        try {
+          // Fetch balance data from getClientBalance API
+          const balanceController = new AbortController();
+          const balanceTimeout = setTimeout(() => balanceController.abort(), 5000);
+          const balanceResponse = await fetch(
+            `http://18.175.242.21:5003/api/Users/${accountId}/getClientBalance`,
+            { headers: { accept: '*/*' }, signal: balanceController.signal }
+          );
+          clearTimeout(balanceTimeout);
+
+          if (balanceResponse.ok) {
+            const balanceData = await balanceResponse.json();
+            console.log(`[All Accounts] Balance API response for ${accountId}:`, JSON.stringify(balanceData).substring(0, 400));
+            // Response structure: { Success: true, Data: { Balance, Equity, Profit, Margin, ... } }
+            const dataObj = balanceData?.Data || balanceData?.data || balanceData;
+            if (dataObj) {
+              // Try multiple possible field name variations
+              balance = Number(dataObj.Balance ?? dataObj.balance ?? 0);
+              equity = Number(dataObj.Equity ?? dataObj.equity ?? 0);
+              profit = Number(dataObj.Profit ?? dataObj.profit ?? dataObj.Floating ?? dataObj.floating ?? 0);
+              console.log(`[All Accounts] Parsed for ${accountId}: balance=${balance}, equity=${equity}, profit=${profit}`);
+              console.log(`[All Accounts] Raw data keys:`, Object.keys(dataObj));
+            } else {
+              console.warn(`[All Accounts] No Data object found in response for ${accountId}:`, balanceData);
+            }
+          } else {
+            console.warn(`[All Accounts] Balance API returned status ${balanceResponse.status} for ${accountId}`);
+          }
+        } catch (error) {
+          console.error(`[All Accounts] Error fetching balance for ${accountId}:`, error.message, error.stack);
+        }
+
+        // Try to fetch account profile from MT5 API (optional, for group name and demo check)
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 5000);
+          const response = await fetch(
+            `http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`,
+            { headers: { accept: '*/*' }, signal: controller.signal }
+          );
+          clearTimeout(timeout);
+
+          if (response.ok) {
+            const data = await response.json();
+            const payload = data?.Data || data?.data;
+            if (payload) {
+              // Check if demo account
+              const accountType = payload?.AccountType ?? payload?.accountType ?? payload?.AccountTypeText ?? payload?.accountTypeText ?? null;
+              const groupIdFull = payload?.Group || payload?.group || '';
+              isDemo = 
+                (accountType && String(accountType).toLowerCase().includes('demo')) ||
+                (groupIdFull && String(groupIdFull).toLowerCase().includes('demo'));
+
+              // Extract group name
+              if (groupIdFull) {
+                groupName = groupIdFull;
+                if (typeof groupName === 'string') {
+                  const match = groupName.match(/Bbook\\([^\\/]+)/i) || groupName.match(/Bbook\\\\([^\\/]+)/i);
+                  if (match && match[1]) {
+                    groupName = match[1];
+                  } else if (groupName.includes('\\')) {
+                    const parts = groupName.split('\\');
+                    groupName = parts.length >= 3 ? parts[2] : parts[parts.length - 1];
+                  } else if (groupName.includes('/')) {
+                    const parts = groupName.split('/');
+                    groupName = parts[parts.length - 1];
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          // Continue with default values if API fails
+          console.warn(`Could not fetch MT5 profile for account ${accountId}, using defaults`);
+        }
+
+        // If profit from API is 0, use profit from trade history
+        const finalProfit = profit !== 0 ? profit : Number(totalProfitFromHistory || 0);
+        
+        // Include ALL accounts, even if API fails or if we can't determine if it's demo
+        // The frontend can filter if needed, but we show all accounts from referred users
+        return {
+          clientAccount: String(accountId), // Ensure it's a string for display
+          profit: finalProfit, // Use profit from getClientBalance API or trade history
+          balance: balance, // Balance from getClientBalance API
+          equity: equity, // Equity from getClientBalance API
+          totalProfit: totalProfitFromHistory, // Total profit from trade history (for commission calculation)
+          volumeLots: totalVolumeLots,
+          volumeMlnUSD: totalVolumeMlnUSD,
+          clientId: userId,
+          partnerCode: userInfo.partnerCode,
+          comment: '-',
+          signupDate: userInfo.joinDate,
+          lastTradingDate: lastTradingDate,
+          country: userInfo.country,
+          accountType: groupName || 'Standard',
+          userEmail: userInfo.email,
+          userName: userInfo.name || userInfo.email,
+          isDemo: isDemo
+        };
+      })
+    );
+
+    // Include all accounts (don't filter out nulls or demos - show everything)
+    const validAccounts = allAccounts.filter(acc => acc !== null);
+
+    console.log(`[All Accounts] Returning ${validAccounts.length} valid accounts`);
+    if (validAccounts.length > 0) {
+      console.log(`[All Accounts] Sample account:`, validAccounts[0]);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        accounts: validAccounts,
+        total: validAccounts.length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching all accounts:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Unable to fetch accounts',
+      error: process.env.NODE_ENV !== 'production' ? error.message : undefined
+    });
+  }
+});
+
 // Account statistics (live MT5 balances)
 router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, res) => {
   try {
@@ -1073,20 +1703,56 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       return res.status(404).json({ success: false, message: 'IB not found' });
     }
 
-    const email = ibResult.rows[0].email;
-    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
-    if (userResult.rows.length === 0) {
+    // Get IB's own user_id to exclude
+    const ibEmail = ibResult.rows[0].email;
+    const ibUserResult = await query('SELECT id FROM "User" WHERE email = $1', [ibEmail]);
+    const ibUserId = ibUserResult.rows.length > 0 ? String(ibUserResult.rows[0].id) : null;
+
+    // Get referred user_ids (from ib_referrals and ib_requests)
+    const referredUserIds = [];
+    try {
+      // From ib_referrals
+      const refRes = await query(
+        'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+        [id]
+      );
+      refRes.rows.forEach(row => {
+        if (row.user_id) referredUserIds.push(String(row.user_id));
+      });
+
+      // From ib_requests where referred_by = id
+      const ibRefRes = await query(
+        `SELECT u.id as user_id 
+         FROM ib_requests ir
+         JOIN "User" u ON u.email = ir.email
+         WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+        [id]
+      );
+      ibRefRes.rows.forEach(row => {
+        if (row.user_id) referredUserIds.push(String(row.user_id));
+      });
+    } catch (error) {
+      console.error('Error getting referred user IDs:', error);
+    }
+
+    if (referredUserIds.length === 0) {
       return res.json({
         success: true,
         data: {
           totals: { totalAccounts: 0, totalBalance: 0, totalEquity: 0 },
-          accounts: []
+          accounts: [],
+          trades: [],
+          tradeSummary: { totalTrades: 0, totalVolume: 0, totalProfit: 0, totalIbCommission: 0 }
         }
       });
     }
 
-    const userId = userResult.rows[0].id;
-    const accountsResult = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
+    // Get accounts from referred users only (exclude IB's own accounts)
+    const accountsResult = await query(
+      `SELECT "accountId", "userId" FROM "MT5Account" 
+       WHERE "userId" = ANY($1::text[])`,
+      [referredUserIds]
+    );
 
     const totals = {
       totalAccounts: accountsResult.rows.length,
@@ -1157,7 +1823,33 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       };
     };
 
-    const accounts = await Promise.all(accountsResult.rows.map(r => fetchOne(r.accountId)));
+    // Create a map of accountId to userId for reference
+    const accountToUserMap = new Map();
+    accountsResult.rows.forEach(row => {
+      accountToUserMap.set(String(row.accountId), String(row.userId));
+    });
+
+    // Get user emails for display
+    const userIds = [...new Set(accountsResult.rows.map(r => String(r.userId)))];
+    const userEmailMap = new Map();
+    if (userIds.length > 0) {
+      const userEmailsRes = await query(
+        `SELECT id, email FROM "User" WHERE id = ANY($1::text[])`,
+        [userIds]
+      );
+      userEmailsRes.rows.forEach(row => {
+        userEmailMap.set(String(row.id), row.email);
+      });
+    }
+
+    const accounts = await Promise.all(accountsResult.rows.map(async r => {
+      const accountData = await fetchOne(r.accountId);
+      if (accountData) {
+        accountData.userId = String(r.userId);
+        accountData.userEmail = userEmailMap.get(String(r.userId)) || null;
+      }
+      return accountData;
+    }));
     
     // Filter out demo accounts - only show real/live accounts
     const realAccounts = accounts.filter(acc => !acc.isDemo);
@@ -1219,13 +1911,29 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
     });
 
     // Fetch trades for this IB (closed positions with non-zero P&L).
+    // EXCLUDE IB's own trades - only include trades from referred users
     // Admin view should reflect all historical trades; do not restrict by approval date.
-    const tradesRes = await query(
-      `SELECT account_id, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, created_at
-       FROM ib_trade_history
-       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
-      [id]
-    );
+    let tradesQuery = `
+      SELECT account_id, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, created_at, user_id
+      FROM ib_trade_history
+      WHERE ib_request_id = $1 
+        AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+        AND user_id = ANY($2::text[])`;
+    const tradesParams = [id, referredUserIds];
+    
+    // Exclude IB's own trades if IB has a user_id
+    if (ibUserId) {
+      tradesQuery = `
+        SELECT account_id, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, created_at, user_id
+        FROM ib_trade_history
+        WHERE ib_request_id = $1 
+          AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
+          AND user_id != $3
+          AND user_id = ANY($2::text[])`;
+      tradesParams.push(ibUserId);
+    }
+    
+    const tradesRes = await query(tradesQuery, tradesParams);
 
     const normalize = (gid) => {
       if (!gid) return '';
@@ -1785,24 +2493,41 @@ async function syncTradesForAccount({ ibId, userId, accountId }) {
 
 async function getAccountStats(ibId) {
   try {
-    // First, get the email from the IB request
-    const ibResult = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
-    if (ibResult.rows.length === 0) {
+    // Get referred user_ids (from ib_referrals and ib_requests)
+    const referredUserIds = [];
+    try {
+      // From ib_referrals
+      const refRes = await query(
+        'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+        [ibId]
+      );
+      refRes.rows.forEach(row => {
+        if (row.user_id) referredUserIds.push(String(row.user_id));
+      });
+
+      // From ib_requests where referred_by = ibId
+      const ibRefRes = await query(
+        `SELECT u.id as user_id 
+         FROM ib_requests ir
+         JOIN "User" u ON u.email = ir.email
+         WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+        [ibId]
+      );
+      ibRefRes.rows.forEach(row => {
+        if (row.user_id) referredUserIds.push(String(row.user_id));
+      });
+    } catch (error) {
+      console.error('Error getting referred user IDs in getAccountStats:', error);
+    }
+
+    if (referredUserIds.length === 0) {
       return { totalAccounts: 0, totalBalance: 0, totalEquity: 0 };
     }
-    const email = ibResult.rows[0].email;
 
-    // Get the User UUID from the User table
-    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [email]);
-    if (userResult.rows.length === 0) {
-      return { totalAccounts: 0, totalBalance: 0, totalEquity: 0 };
-    }
-    const userId = userResult.rows[0].id;
-
-    // Step 1: Get all MT5 accounts from database first
+    // Step 1: Get all MT5 accounts from referred users only (exclude IB's own accounts)
     const result = await query(
-      'SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1',
-      [userId]
+      `SELECT "accountId" FROM "MT5Account" WHERE "userId" = ANY($1::text[])`,
+      [referredUserIds]
     );
 
     if (result.rows.length === 0) {
@@ -2059,9 +2784,59 @@ async function getTreeStructure(rootIbId) {
       } catch {}
       return [];
     };
-    // Helper: compute own lots and commission breakdown for a given IB
+    // Helper: get IB's own user_id to exclude from commission calculations
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Helper: get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Helper: compute own lots and commission breakdown for a given IB (EXCLUDING IB's own trades)
     const getOwnStats = async (ibId) => {
-      const allowed = await getRealAccountIdsByIbId(ibId);
+      // Get IB's own user_id to exclude
+      const ibUserId = await getIBUserId(ibId);
+      // Get referred user_ids to include
+      const referredUserIds = await getReferredUserIds(ibId);
+      
+      if (referredUserIds.length === 0) {
+        return { ownLots: 0, tradeCount: 0, fixed: 0, spread: 0 };
+      }
+
       // Fetch approved group mappings for this IB
       const assignRes = await query(
         `SELECT group_id, usd_per_lot, spread_share_percentage
@@ -2079,16 +2854,27 @@ async function getTreeStructure(rootIbId) {
         const k = normalize(r.group_id);
         if (k) approved.set(k, { usdPerLot: Number(r.usd_per_lot || 0), spreadPct: Number(r.spread_share_percentage || 0) });
       }
-      if (!allowed.length || !approved.size) return { ownLots: 0, tradeCount: 0, fixed: 0, spread: 0 };
+      if (!approved.size) return { ownLots: 0, tradeCount: 0, fixed: 0, spread: 0 };
+
+      // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+      let userFilter = '';
+      const params = [ibId];
+      if (ibUserId) {
+        params.push(ibUserId);
+        userFilter = `AND user_id != $${params.length}`;
+      }
+      params.push(referredUserIds);
+      const userInClause = `AND user_id = ANY($${params.length}::text[])`;
 
       const res = await query(
         `SELECT group_id, COALESCE(SUM(volume_lots),0) AS lots, COUNT(*)::int AS trade_count, COALESCE(SUM(ib_commission),0) AS fixed
          FROM ib_trade_history
          WHERE ib_request_id = $1
            AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
-           AND account_id = ANY($2)
+           ${userFilter}
+           ${userInClause}
          GROUP BY group_id`,
-        [ibId, allowed]
+        params
       );
       let ownLots = 0, tradeCount = 0, fixed = 0, spread = 0;
       for (const row of res.rows) {

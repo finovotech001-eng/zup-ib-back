@@ -354,9 +354,88 @@ router.get('/commission-analytics', authenticateToken, async (req, res) => {
       }
     }
 
+    // Helper: Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Helper: Get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Get IB's own user_id to exclude
+    const ibUserId = await getIBUserId(ibId);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(ibId);
+
+    // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+    let userFilter = '';
+    const baseParams = [ibId, periodStart.toISOString()];
+    if (ibUserId) {
+      baseParams.push(ibUserId);
+      userFilter = `AND user_id != $${baseParams.length}`;
+    }
+    if (referredUserIds.length > 0) {
+      baseParams.push(referredUserIds);
+      const userInClause = `AND user_id = ANY($${baseParams.length}::text[])`;
+      userFilter = userFilter ? `${userFilter} ${userInClause}` : userInClause;
+    } else {
+      // No referred users, return empty result
+      return res.json({
+        success: true,
+        data: {
+          totalCount: 0,
+          totalCommission: 0,
+          fixedCommission: 0,
+          spreadCommission: 0,
+          totalProfit: 0,
+          totalVolume: 0,
+          totalTrades: 0,
+          thisMonth: 0,
+          averageDaily: 0,
+          ledger: [],
+          page: page,
+          limit: limit
+        }
+      });
+    }
+
     // Fetch total count for pagination
     // Only show DEALS OUT: closed positions where profit exists (profit != 0)
-    // Deal IN has profit = 0, Deal OUT has profit != 0 (can be positive or negative)
+    // Only from referred users, excluding IB's own trades
     const countQuery = `
       SELECT COUNT(*)::int AS total
       FROM ib_trade_history
@@ -366,13 +445,14 @@ router.get('/commission-analytics', authenticateToken, async (req, res) => {
         AND profit IS NOT NULL
         AND profit != 0
         AND synced_at >= $2
+        ${userFilter}
     `;
-    const countResult = await query(countQuery, [ibId, periodStart.toISOString()]);
+    const countResult = await query(countQuery, baseParams);
     const totalCount = countResult.rows[0]?.total || 0;
 
     // Fetch ALL trades for this IB from ib_trade_history
     // Only DEALS OUT: closed positions where profit exists (profit != 0)
-    // We need all trades for aggregations, but we'll paginate the ledger separately
+    // Only from referred users, excluding IB's own trades
     const allTradesQuery = `
       SELECT 
         id, order_id, account_id, symbol, order_type, volume_lots, 
@@ -385,10 +465,11 @@ router.get('/commission-analytics', authenticateToken, async (req, res) => {
         AND profit IS NOT NULL
         AND profit != 0
         AND synced_at >= $2
+        ${userFilter}
       ORDER BY synced_at DESC
     `;
 
-    const allTradesResult = await query(allTradesQuery, [ibId, periodStart.toISOString()]);
+    const allTradesResult = await query(allTradesQuery, baseParams);
     const allTrades = allTradesResult.rows;
 
     // Calculate spread commission for each trade
@@ -617,19 +698,55 @@ router.get('/commission', authenticateToken, async (req, res) => {
     const ib = req.user;
     const ibId = ib.id;
 
-    // Resolve allowed real (non-demo) MT5 accounts for this user
-    const userResult = await query('SELECT id FROM "User" WHERE email = $1', [ib.email]);
-    const allowedAccounts = new Set();
-    if (userResult.rows.length) {
-      const userId = userResult.rows[0].id;
-      const accountsRes = await query('SELECT "accountId" FROM "MT5Account" WHERE "userId" = $1', [userId]);
-      const profiles = await Promise.all(accountsRes.rows.map(async r => ({ id: String(r.accountId), prof: await fetchMt5Profile(r.accountId) })));
-      for (const { id, prof } of profiles) {
-        const group = prof?.Group || prof?.group || '';
-        const accountType = prof?.AccountType ?? prof?.accountType ?? prof?.AccountTypeText ?? prof?.accountTypeText ?? '';
-        const isDemo = String(group).toLowerCase().includes('demo') || String(accountType).toLowerCase().includes('demo');
-        if (!isDemo) allowedAccounts.add(id);
+    // Helper: Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
       }
+    };
+
+    // Helper: Get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Get IB's own user_id to exclude
+    const ibUserId = await getIBUserId(ibId);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(ibId);
+
+    if (referredUserIds.length === 0) {
+      return res.json({ success: true, data: { total: 0, fixed: 0, spreadShare: 0, pending: 0, paid: 0, history: [] } });
     }
 
     // Approved groups map from assignments
@@ -658,18 +775,34 @@ router.get('/commission', authenticateToken, async (req, res) => {
       }
     }
 
-    // Fetch trades and filter to allowed accounts + approved groups
+    // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+    let userFilter = '';
+    const params = [ibId];
+    if (ibUserId) {
+      params.push(ibUserId);
+      userFilter = `AND user_id != $${params.length}`;
+    }
+    params.push(referredUserIds);
+    const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
+    // Fetch trades - only from referred users, excluding IB's own trades
     const tradesRes = await query(
-      `SELECT account_id, order_id, symbol, group_id, volume_lots, profit, ib_commission, synced_at, updated_at
+      `SELECT account_id, order_id, symbol, group_id, volume_lots, profit, ib_commission, synced_at, updated_at, user_id
        FROM ib_trade_history
-       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
-      [ibId]
+       WHERE ib_request_id = $1 
+         AND close_price IS NOT NULL 
+         AND close_price != 0 
+         AND profit != 0
+         ${userFilter}
+         ${userInClause}`,
+      params
     );
+
+    // Filter to approved groups only
     const filtered = tradesRes.rows.filter((r) => {
-      const accOk = allowedAccounts.size ? allowedAccounts.has(String(r.account_id)) : false;
       const key = normalize(r.group_id);
       const groupOk = approvedMap.size ? (approvedMap.has(key) || approvedMap.has(String(r.group_id || '').toLowerCase())) : false;
-      return accOk && groupOk;
+      return groupOk;
     });
 
     // Totals
@@ -720,31 +853,144 @@ router.get('/commission', authenticateToken, async (req, res) => {
 });
 
 // GET /api/user/trades -> paginated trade history from DB with spread pct enriched
+// Only shows trades from referred users, excluding IB's own trades
 router.get('/trades', authenticateToken, async (req, res) => {
   try {
     const ib = req.user;
     const ibId = ib.id;
     const { accountId = null, page = 1, pageSize = 50 } = req.query;
 
-    // Resolve this user's UUID
-    const userResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ib.email]);
-    if (!userResult.rows.length) {
+    // Helper: Get IB's own user_id to exclude
+    const getIBUserId = async (ibId) => {
+      try {
+        const ibRes = await query('SELECT email FROM ib_requests WHERE id = $1', [ibId]);
+        if (ibRes.rows.length === 0) return null;
+        const userRes = await query('SELECT id FROM "User" WHERE email = $1', [ibRes.rows[0].email]);
+        return userRes.rows.length > 0 ? String(userRes.rows[0].id) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Helper: Get list of referred user_ids (from ib_referrals and ib_requests)
+    const getReferredUserIds = async (ibId) => {
+      const userIds = new Set();
+      try {
+        // Get user_ids from ib_referrals
+        const refRes = await query(
+          'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+          [ibId]
+        );
+        refRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+
+        // Get user_ids from ib_requests where referred_by = ibId
+        const ibRefRes = await query(
+          `SELECT u.id as user_id 
+           FROM ib_requests ir
+           JOIN "User" u ON u.email = ir.email
+           WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+          [ibId]
+        );
+        ibRefRes.rows.forEach(row => {
+          if (row.user_id) userIds.add(String(row.user_id));
+        });
+      } catch (error) {
+        console.error('Error getting referred user IDs:', error);
+      }
+      return Array.from(userIds);
+    };
+
+    // Get IB's own user_id to exclude
+    const ibUserId = await getIBUserId(ibId);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(ibId);
+
+    if (referredUserIds.length === 0) {
       return res.json({ success: true, data: { trades: [], total: 0, page: Number(page), pageSize: Number(pageSize) } });
     }
-    const userId = userResult.rows[0].id;
 
     const limit = Math.min(Math.max(Number(pageSize) || 50, 1), 500);
     const offset = (Math.max(Number(page) || 1, 1) - 1) * limit;
 
     // Simple 30s cache for paginated responses
-    const cacheKey = `user-trades:${ibId}:${userId}:${accountId||'*'}:${limit}:${offset}`;
+    const cacheKey = `user-trades:${ibId}:${accountId||'*'}:${limit}:${offset}`;
     const cached = analyticsCache.get(cacheKey);
     if (cached && cached.expires > Date.now()) {
       return res.json({ success: true, data: cached.payload });
     }
 
-    // Fetch trades from DB (only this user's trades; model filters closed & profit!=0)
-    let result = await IBTradeHistory.getTrades({ userId, accountId, limit, offset });
+    // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+    let userFilter = '';
+    const params = [ibId];
+    if (ibUserId) {
+      params.push(ibUserId);
+      userFilter = `AND user_id != $${params.length}`;
+    }
+    params.push(referredUserIds);
+    const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
+    let accountFilter = '';
+    if (accountId) {
+      params.push(String(accountId));
+      accountFilter = `AND account_id = $${params.length}`;
+    }
+
+    // Count total trades
+    const countQuery = `
+      SELECT COUNT(*)::int AS count 
+      FROM ib_trade_history 
+      WHERE ib_request_id = $1 
+        AND close_price IS NOT NULL 
+        AND close_price != 0 
+        AND profit != 0
+        ${userFilter}
+        ${userInClause}
+        ${accountFilter}
+    `;
+    const countRes = await query(countQuery, params);
+    const total = Number(countRes.rows?.[0]?.count || 0);
+
+    // Fetch trades from all referred users, excluding IB's own trades
+    params.push(Number(limit), Number(offset));
+    const listQuery = `
+      SELECT *
+      FROM ib_trade_history
+      WHERE ib_request_id = $1 
+        AND close_price IS NOT NULL 
+        AND close_price != 0 
+        AND profit != 0
+        ${userFilter}
+        ${userInClause}
+        ${accountFilter}
+      ORDER BY synced_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `;
+    const listRes = await query(listQuery, params);
+    
+    const trades = listRes.rows.map((row) => ({
+      account_id: row.account_id,
+      mt5_deal_id: row.order_id,
+      order_id: row.order_id,
+      symbol: row.symbol,
+      volume_lots: Number(row.volume_lots || 0),
+      lots: Number(row.volume_lots || 0),
+      profit: Number(row.profit || 0),
+      commission: 0,
+      ib_commission: Number(row.ib_commission || 0),
+      group_id: row.group_id || null,
+      close_time: row.updated_at || row.synced_at || null,
+      synced_at: row.synced_at,
+      updated_at: row.updated_at
+    }));
+
+    let result = {
+      trades,
+      total,
+      page: Math.floor(Number(offset) / (Number(limit) || 1)) + 1,
+      pageSize: Number(limit)
+    };
 
     // Enrich with spread pct using approved group assignments
     try {
