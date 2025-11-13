@@ -12,6 +12,90 @@ import { IBCommission } from '../models/IBCommission.js';
 const router = express.Router();
 const ALLOWED_IB_TYPES = IB_REQUEST_TYPE_VALUES;
 
+/**
+ * Normalize group ID by extracting the last segment from path
+ * Example: 'real\Bbook\Standard\dynamic-2000x-20Pips' -> 'dynamic-2000x-20pips'
+ */
+function normalizeGroupId(groupId) {
+  if (!groupId) return '';
+  const s = String(groupId).toLowerCase().trim();
+  const parts = s.split(/[\\/]/);
+  return parts[parts.length - 1] || s;
+}
+
+/**
+ * Find matching commission rule for a normalized group ID
+ * Uses flexible matching: exact -> partial -> first available
+ */
+function findMatchingRule(normalizedGroupId, commissionGroupsMap) {
+  if (!normalizedGroupId || !commissionGroupsMap || commissionGroupsMap.size === 0) {
+    return null;
+  }
+
+  // Try exact match first
+  let rule = commissionGroupsMap.get(normalizedGroupId);
+  if (rule) return rule;
+
+  // Try partial match (check if normalized key contains any approved key or vice versa)
+  for (const [approvedKey, approvedRule] of commissionGroupsMap.entries()) {
+    if (normalizedGroupId.includes(approvedKey) || approvedKey.includes(normalizedGroupId)) {
+      return approvedRule;
+    }
+  }
+
+  // Fallback to first available group assignment
+  if (commissionGroupsMap.size > 0) {
+    return Array.from(commissionGroupsMap.values())[0];
+  }
+
+  return null;
+}
+
+/**
+ * Calculate commission from trades using commission structure
+ * @param {Array} trades - Array of trade objects with { group_id, volume_lots }
+ * @param {Map} commissionGroupsMap - Map of normalized group_id -> { usdPerLot, spreadPct }
+ * @returns {Object} { fixed, spread, total, totalLots, totalTrades }
+ */
+function calculateCommissionFromTrades(trades, commissionGroupsMap) {
+  let fixed = 0;
+  let spread = 0;
+  let totalLots = 0;
+  let totalTrades = 0;
+
+  if (!Array.isArray(trades) || trades.length === 0) {
+    return { fixed: 0, spread: 0, total: 0, totalLots: 0, totalTrades: 0 };
+  }
+
+  for (const trade of trades) {
+    const lots = Number(trade.volume_lots || 0);
+    if (lots <= 0) continue;
+
+    totalLots += lots;
+    totalTrades += 1;
+
+    // Match group to commission structure (flexible matching)
+    const normalized = normalizeGroupId(trade.group_id);
+    const rule = findMatchingRule(normalized, commissionGroupsMap);
+
+    if (rule) {
+      const usdPerLot = Number(rule.usdPerLot || 0);
+      const spreadPct = Number(rule.spreadPct || 0);
+      
+      fixed += lots * usdPerLot;
+      spread += lots * (spreadPct / 100);
+    }
+  }
+
+  return {
+    fixed,
+    spread,
+    total: fixed + spread,
+    totalLots,
+    totalTrades
+  };
+}
+
 
 // Get all IB requests with pagination
 router.get('/', authenticateAdminToken, async (req, res) => {
@@ -1144,11 +1228,9 @@ router.get('/profiles/:id/referred-users', authenticateAdminToken, async (req, r
         let totalCommission = 0;
         let tradeCount = 0;
         try {
-          const statsRes = await query(
-            `SELECT 
-               COALESCE(SUM(volume_lots), 0) AS total_volume,
-               COALESCE(SUM(ib_commission), 0) AS total_commission,
-               COUNT(*)::int AS trade_count
+          // Get trades for this user
+          const tradesRes = await query(
+            `SELECT group_id, volume_lots
              FROM ib_trade_history
              WHERE ib_request_id = $1 
                AND user_id = $2
@@ -1157,12 +1239,17 @@ router.get('/profiles/:id/referred-users', authenticateAdminToken, async (req, r
                AND profit != 0`,
             [id, user.userId]
           );
-          if (statsRes.rows.length > 0) {
-            totalVolume = Number(statsRes.rows[0].total_volume || 0);
-            totalCommission = Number(statsRes.rows[0].total_commission || 0);
-            tradeCount = Number(statsRes.rows[0].trade_count || 0);
+
+          if (tradesRes.rows.length > 0) {
+            // Calculate commission using commission structure
+            const commissionResult = calculateCommissionFromTrades(tradesRes.rows, commissionGroupsMap);
+            totalVolume = commissionResult.totalLots;
+            totalCommission = commissionResult.total;
+            tradeCount = commissionResult.totalTrades;
           }
-        } catch {}
+        } catch (error) {
+          console.error(`Error calculating commission for user ${user.userId}:`, error);
+        }
 
         // Determine if active (has trades or accounts)
         const isActive = accountCount > 0 || tradeCount > 0;
@@ -1300,21 +1387,35 @@ router.get('/profiles/:ibId/user/:userId/accounts', authenticateAdminToken, asyn
           }
         }
 
-        // Get commission structure for this account
-        const commissionRes = await query(
-          `SELECT structure_name, usd_per_lot, spread_share_percentage
+        // Get commission groups for this IB
+        const commissionGroupsRes = await query(
+          `SELECT group_id, structure_name, usd_per_lot, spread_share_percentage
            FROM ib_group_assignments
-           WHERE ib_request_id = $1 AND group_id = $2`,
-          [ibId, groupIdFull]
+           WHERE ib_request_id = $1`,
+          [ibId]
         );
 
-        // Get trade stats for this account - only closed trades (deals out) with profit != 0
-        const tradeStatsRes = await query(
-          `SELECT 
-             COALESCE(SUM(volume_lots), 0) AS total_volume,
-             COALESCE(SUM(ib_commission), 0) AS total_commission,
-             COALESCE(SUM(profit), 0) AS total_profit,
-             COUNT(*)::int AS trade_count
+        // Build commission groups map
+        const commissionGroupsMap = new Map();
+        for (const r of commissionGroupsRes.rows) {
+          const k = normalizeGroupId(r.group_id);
+          if (k) {
+            commissionGroupsMap.set(k, {
+              spreadPct: Number(r.spread_share_percentage || 0),
+              usdPerLot: Number(r.usd_per_lot || 0),
+              structureName: r.structure_name
+            });
+          }
+        }
+
+        // Find matching commission structure for this account's group
+        const normalizedGroup = normalizeGroupId(groupIdFull);
+        const matchingRule = findMatchingRule(normalizedGroup, commissionGroupsMap);
+        const commissionInfo = matchingRule || {};
+
+        // Get trades for this account - only closed trades (deals out) with profit != 0
+        const tradesRes = await query(
+          `SELECT group_id, volume_lots, profit
            FROM ib_trade_history
            WHERE ib_request_id = $1 
              AND account_id = $2
@@ -1324,11 +1425,14 @@ router.get('/profiles/:ibId/user/:userId/accounts', authenticateAdminToken, asyn
           [ibId, String(accountId)]
         );
 
-        const tradeStats = tradeStatsRes.rows[0] || {};
-        const commissionInfo = commissionRes.rows[0] || {};
+        // Calculate commission using commission structure
+        const commissionResult = calculateCommissionFromTrades(tradesRes.rows, commissionGroupsMap);
+        
+        // Calculate total profit from trades
+        const totalProfit = tradesRes.rows.reduce((sum, row) => sum + Number(row.profit || 0), 0);
         
         // If profit from API is 0, use profit from trade history
-        const finalProfit = profit !== 0 ? profit : Number(tradeStats.total_profit || 0);
+        const finalProfit = profit !== 0 ? profit : totalProfit;
         
         // If margin is 0, calculate from equity and balance (margin = balance - equity + profit, or use marginFree)
         const finalMargin = margin !== 0 ? margin : (balance - equity + finalProfit);
@@ -1344,13 +1448,13 @@ router.get('/profiles/:ibId/user/:userId/accounts', authenticateAdminToken, asyn
           groupId: groupIdFull,
           accountType: accountType || (isDemo ? 'Demo' : 'Live'),
           isDemo,
-          isEligibleForCommission: commissionRes.rows.length > 0,
-          commissionStructure: commissionInfo.structure_name || null,
-          usdPerLot: Number(commissionInfo.usd_per_lot || 0),
-          spreadSharePercentage: Number(commissionInfo.spread_share_percentage || 0),
-          totalVolume: Number(tradeStats.total_volume || 0),
-          totalCommission: Number(tradeStats.total_commission || 0),
-          tradeCount: Number(tradeStats.trade_count || 0)
+          isEligibleForCommission: matchingRule !== null,
+          commissionStructure: commissionInfo.structureName || null,
+          usdPerLot: Number(commissionInfo.usdPerLot || 0),
+          spreadSharePercentage: Number(commissionInfo.spreadPct || 0),
+          totalVolume: commissionResult.totalLots,
+          totalCommission: commissionResult.total,
+          tradeCount: commissionResult.totalTrades
         };
       } catch (error) {
         console.error(`Error fetching account ${accountId}:`, error);
@@ -1809,15 +1913,36 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
     console.log(`[Sync Commission] IB User ID (to exclude): ${ibUserIdForExclusion}`);
     console.log(`[Sync Commission] Referred User IDs (${referredUserIds.length}):`, referredUserIds);
     console.log(`[Sync Commission] Commission Groups (${groupsResult.rows.length}):`, groupsResult.rows.map(r => ({ group_id: r.group_id, spread: r.spread_share_percentage })));
+    
+    // Diagnostic: Check if there are ANY trades for this IB (without filters)
+    const diagnosticQuery = await query(
+      `SELECT COUNT(*)::int AS total, COALESCE(SUM(volume_lots), 0) AS total_lots, COALESCE(SUM(ib_commission), 0) AS total_commission
+       FROM ib_trade_history
+       WHERE ib_request_id = $1 AND close_price IS NOT NULL AND close_price != 0 AND profit != 0`,
+      [id]
+    );
+    console.log(`[Sync Commission] DIAGNOSTIC - All trades for IB ${id}:`, diagnosticQuery.rows[0]);
+
+    // Build commission groups map
+    const commissionGroupsMap = new Map();
+    for (const r of groupsResult.rows) {
+      const k = normalizeGroupId(r.group_id);
+      if (k) {
+        commissionGroupsMap.set(k, {
+          spreadPct: Number(r.spread_share_percentage || 0),
+          usdPerLot: Number(r.usd_per_lot || 0)
+        });
+      }
+    }
+
+    console.log(`[Sync Commission] Commission groups map:`, Array.from(commissionGroupsMap.entries()).map(([k, v]) => ({ key: k, spreadPct: v.spreadPct, usdPerLot: v.usdPerLot })));
 
     // Calculate commission, trades, and lots from referred users' trades only (excluding IB's own trades)
     let balance = 0;
-    let fixedCommission = 0;
-    let spreadCommission = 0;
     let totalTrades = 0;
     let totalLots = 0;
 
-    if (referredUserIds.length > 0) {
+    if (referredUserIds.length > 0 && commissionGroupsMap.size > 0) {
       // Build WHERE clause to exclude IB's own trades and only include referred users' trades
       let userFilter = '';
       const params = [id];
@@ -1828,84 +1953,34 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
       params.push(referredUserIds);
       const userInClause = `AND user_id = ANY($${params.length}::text[])`;
 
-      // Get approved groups map for spread calculation
-      const normalize = (gid) => {
-        if (!gid) return '';
-        const s = String(gid).toLowerCase().trim();
-        const parts = s.split(/[\\/]/);
-        return parts[parts.length - 1] || s;
-      };
-      const approvedMap = new Map();
-      for (const row of groupsResult.rows) {
-        const keys = [
-          String(row.group_id || '').toLowerCase(),
-          String(row.group_name || '').toLowerCase(),
-          normalize(row.group_id)
-        ].filter(k => k);
-        for (const k of keys) {
-          approvedMap.set(k, {
-            spreadSharePercentage: Number(row.spread_share_percentage || 0),
-            usdPerLot: Number(row.usd_per_lot || 0)
-          });
-        }
-      }
-
-      // Get total trades count and total lots in one query
-      const statsRes = await query(
-        `SELECT 
-           COUNT(*)::int AS total_trades,
-           COALESCE(SUM(volume_lots), 0) AS total_lots
+      // Get all trades from referred users (only closed trades with profit != 0)
+      const tradesRes = await query(
+        `SELECT group_id, volume_lots
          FROM ib_trade_history
-         WHERE ib_request_id = $1 
-           AND close_price IS NOT NULL 
-           AND close_price != 0 
-           AND profit != 0
+         WHERE ib_request_id = $1
+           AND close_price IS NOT NULL AND close_price != 0 AND profit != 0
            ${userFilter}
            ${userInClause}`,
         params
       );
 
-      totalTrades = Number(statsRes.rows[0]?.total_trades || 0);
-      totalLots = Number(statsRes.rows[0]?.total_lots || 0);
+      console.log(`[Sync Commission] Found ${tradesRes.rows.length} trades from referred users`);
+
+      // Calculate commission using helper function
+      const commissionResult = calculateCommissionFromTrades(tradesRes.rows, commissionGroupsMap);
       
-      console.log(`[Sync Commission] Total trades: ${totalTrades}, Total lots: ${totalLots}`);
+      balance = commissionResult.total;
+      totalTrades = commissionResult.totalTrades;
+      totalLots = commissionResult.totalLots;
 
-      // Get commission by group for calculation
-      const tradesRes = await query(
-        `SELECT 
-           group_id,
-           COALESCE(SUM(volume_lots), 0) AS total_volume_lots,
-           COALESCE(SUM(ib_commission), 0) AS total_ib_commission
-         FROM ib_trade_history
-         WHERE ib_request_id = $1 
-           AND close_price IS NOT NULL 
-           AND close_price != 0 
-           AND profit != 0
-           ${userFilter}
-           ${userInClause}
-         GROUP BY group_id`,
-        params
-      );
-
-      console.log(`[Sync Commission] Trades query returned ${tradesRes.rows.length} groups`);
-
-      // Calculate total commission (fixed + spread)
-      for (const row of tradesRes.rows) {
-        const groupId = row.group_id || '';
-        const normGroup = normalize(groupId);
-        const assignment = approvedMap.get(normGroup) || approvedMap.get(String(groupId).toLowerCase()) || { spreadSharePercentage: 0, usdPerLot: 0 };
-        
-        const lots = Number(row.total_volume_lots || 0);
-        const fixed = Number(row.total_ib_commission || 0);
-        const spread = lots * (assignment.spreadSharePercentage / 100);
-        
-        fixedCommission += fixed;
-        spreadCommission += spread;
-      }
-      
-      balance = fixedCommission + spreadCommission;
+      console.log(`[Sync Commission] Calculation result: fixed=${commissionResult.fixed}, spread=${commissionResult.spread}, total=${balance}, trades=${totalTrades}, lots=${totalLots}`);
     } else {
-      console.log(`[Sync Commission] WARNING: No referred users found for IB ${id}`);
+      if (referredUserIds.length === 0) {
+        console.log(`[Sync Commission] WARNING: No referred users found for IB ${id}`);
+      }
+      if (commissionGroupsMap.size === 0) {
+        console.log(`[Sync Commission] WARNING: No commission groups found for IB ${id}`);
+      }
     }
 
     console.log(`[Sync Commission] Final calculation: total_commission=${balance}, total_trades=${totalTrades}, total_lots=${totalLots}`);
@@ -2216,28 +2291,53 @@ router.get('/profiles/:id/account-stats', authenticateAdminToken, async (req, re
       approvedMap[k] = v; // keys already lowercased elsewhere
     }
 
-    const accountCommissionMap = new Map();
-    const perAccountStats = new Map(); // {trade_count, total_volume, total_profit, total_ib_commission}
+    // Build commission groups map from eligibleGroups
+    const commissionGroupsMap = new Map();
+    for (const [k, v] of eligibleGroups.entries()) {
+      commissionGroupsMap.set(k, {
+        spreadPct: Number(v.spreadSharePercentage || 0),
+        usdPerLot: Number(v.usdPerLot || 0)
+      });
+    }
 
+    // Group trades by account_id for commission calculation
+    const tradesByAccount = new Map();
     for (const row of tradesRes.rows) {
-      // Skip trades that do not belong to any current (real) account of this user
       const rowAccId = String(row.account_id);
       if (!allowedAccounts.has(rowAccId)) continue;
-      const key = normalize(row.group_id);
-      if (!approvedMap[key]) continue; // skip unapproved groups
+      
+      if (!tradesByAccount.has(rowAccId)) {
+        tradesByAccount.set(rowAccId, []);
+      }
+      tradesByAccount.get(rowAccId).push({
+        group_id: row.group_id,
+        volume_lots: row.volume_lots
+      });
+    }
 
-      const accId = rowAccId;
-      const prev = accountCommissionMap.get(accId) || { totalCommission: 0, tradeCount: 0 };
-      prev.totalCommission += Number(row.ib_commission || 0);
-      prev.tradeCount += 1;
-      accountCommissionMap.set(accId, prev);
+    // Calculate commission for each account using commission structure
+    const accountCommissionMap = new Map();
+    const perAccountStats = new Map();
 
-      const st = perAccountStats.get(accId) || { account_id: accId, trade_count: 0, total_volume: 0, total_profit: 0, total_ib_commission: 0 };
-      st.trade_count += 1;
-      st.total_volume += Number(row.volume_lots || 0);
-      st.total_profit += Number(row.profit || 0);
-      st.total_ib_commission += Number(row.ib_commission || 0);
-      perAccountStats.set(accId, st);
+    for (const [accountId, trades] of tradesByAccount.entries()) {
+      // Calculate commission using helper function
+      const commissionResult = calculateCommissionFromTrades(trades, commissionGroupsMap);
+      
+      accountCommissionMap.set(accountId, {
+        totalCommission: commissionResult.total,
+        tradeCount: commissionResult.totalTrades
+      });
+
+      // Calculate other stats
+      const accountTrades = tradesRes.rows.filter(r => String(r.account_id) === accountId);
+      const st = {
+        account_id: accountId,
+        trade_count: commissionResult.totalTrades,
+        total_volume: commissionResult.totalLots,
+        total_profit: accountTrades.reduce((sum, t) => sum + Number(t.profit || 0), 0),
+        total_ib_commission: commissionResult.total
+      };
+      perAccountStats.set(accountId, st);
     }
 
     // Add commission data and eligibility to each account
