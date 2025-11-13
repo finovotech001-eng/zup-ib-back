@@ -18,6 +18,7 @@ import { IBGroupAssignment } from './models/IBGroupAssignment.js';
 import { IBTradeHistory } from './models/IBTradeHistory.js';
 import { IBWithdrawal } from './models/IBWithdrawal.js';
 import { IBReferral } from './models/IBReferral.js';
+import { IBCommission } from './models/IBCommission.js';
 // import { IBLevelUpHistory } from './models/IBLevelUpHistory.js'; // File removed
 
 // Import routes
@@ -133,6 +134,7 @@ async function initializeDatabase() {
     await IBTradeHistory.createTable();
     await IBWithdrawal.createTable();
     await IBReferral.createTable();
+    await IBCommission.createTable();
     // await IBLevelUpHistory.createTable(); // File removed
     await IBAdmin.seedDefaultAdmin();
     console.log('Database tables initialized successfully');
