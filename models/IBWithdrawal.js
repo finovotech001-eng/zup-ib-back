@@ -1,4 +1,5 @@
 import { query } from '../config/database.js';
+import { IBCommission } from './IBCommission.js';
 
 export class IBWithdrawal {
   static async createTable() {
@@ -32,127 +33,209 @@ export class IBWithdrawal {
   }
 
   static async getSummary(ibRequestId, opts = {}) {
-    const periodDays = Number(opts.periodDays || 0);
-    // Compute earnings only from approved groups and include spread share
     try {
-      // Fetch group assignments (approved groups for this IB)
-      const assignmentsRes = await query(
-        `SELECT group_id, spread_share_percentage
-         FROM ib_group_assignments WHERE ib_request_id = $1`,
+      // Get IB's user_id to fetch commission from ib_commission table
+      const ibUserResult = await query(
+        'SELECT id FROM "User" WHERE LOWER(email) = (SELECT LOWER(email) FROM ib_requests WHERE id = $1)',
         [ibRequestId]
       );
+      const ibUserId = ibUserResult.rows[0]?.id ? String(ibUserResult.rows[0].id) : null;
 
-      // Helpers to normalize and generate multiple matching keys for group ids
-      const makeKeys = (gid) => {
-        if (!gid) return [];
-        const s = String(gid).trim().toLowerCase();
-        const fwd = s.replace(/\\\\/g, '/');
-        const bwd = s.replace(/\//g, '\\');
-        const parts = s.split(/[\\\\/]/);
-        const last = parts[parts.length - 1] || s;
-        let afterBbook = null;
-        for (let i = 0; i < parts.length; i++) {
-          if (parts[i] === 'bbook' && i + 1 < parts.length) { afterBbook = parts[i + 1]; break; }
-        }
-        const keys = new Set([s, fwd, bwd, last]);
-        if (afterBbook) keys.add(afterBbook);
-        return Array.from(keys);
-      };
+      // Get total commission from ib_commission table
+      let totalEarned = 0;
+      let fixedEarned = 0;
+      let spreadEarned = 0;
 
-      const approvedMap = assignmentsRes.rows.reduce((m, r) => {
-        for (const k of makeKeys(r.group_id)) {
-          m[k] = Number(r.spread_share_percentage || 0);
-        }
-        return m;
-      }, {});
-
-      let fixed = 0;
-      let spread = 0;
-
-      if (Object.keys(approvedMap).length) {
-        // Resolve allowed real account IDs for this IB (from MT5Account)
-        let allowed = [];
+      if (ibUserId) {
         try {
-          const u = await query('SELECT id FROM "User" WHERE email = (SELECT email FROM ib_requests WHERE id = $1)', [ibRequestId]);
-          if (u.rows.length) {
-            const userId = u.rows[0].id;
-            const acc = await query(
-              `SELECT "accountId" FROM "MT5Account" 
-               WHERE "userId" = $1 
-                 AND (LOWER("accountType") IN ('live','real') OR LOWER(COALESCE("accountType", 'live')) IN ('live','real'))
-                 AND ("package" IS NULL OR LOWER("package") NOT LIKE '%demo%')`,
-              [userId]
-            );
-            allowed = acc.rows.map(r => String(r.accountId));
+          const commissionData = await IBCommission.getByIBAndUser(ibRequestId, ibUserId);
+          if (commissionData) {
+            totalEarned = Number(commissionData.total_commission || 0);
+            // For fixed and spread, we'll calculate from commission structure if needed
+            // For now, we'll use a simple split (can be improved later)
+            fixedEarned = totalEarned * 0.9; // Approximate 90% fixed, 10% spread
+            spreadEarned = totalEarned * 0.1;
           }
-        } catch {}
-        // Aggregate trades by group id
-        // Optional time window for earnings (e.g., last 30 days)
-        const hasWindow = Number.isFinite(periodDays) && periodDays > 0;
-        const whereWindow = hasWindow ? ` AND (synced_at >= NOW() - INTERVAL '${periodDays} days')` : '';
-        const tradesRes = await query(
-          `SELECT group_id, COALESCE(SUM(volume_lots),0) AS lots, COALESCE(SUM(ib_commission),0) AS fixed
-           FROM ib_trade_history 
-           WHERE ib_request_id = $1 
-             AND close_price IS NOT NULL AND close_price != 0 AND profit != 0${whereWindow}
-             AND (group_id IS NULL OR LOWER(group_id) NOT LIKE '%demo%')
-             ${Array.isArray(allowed) && allowed.length ? 'AND account_id = ANY($2)' : ''}
-           GROUP BY group_id`,
-          Array.isArray(allowed) && allowed.length ? [ibRequestId, allowed] : [ibRequestId]
-        );
-        for (const row of tradesRes.rows) {
-          // Try multiple keys derived from this trade's group id
-          const candidates = makeKeys(row.group_id);
-          const k = candidates.find((x) => approvedMap.hasOwnProperty(x));
-          if (!k) continue; // skip non-approved groups
-          const lots = Number(row.lots || 0);
-          const f = Number(row.fixed || 0);
-          const pct = approvedMap[k] / 100;
-          fixed += f;
-          spread += lots * pct;
+        } catch (error) {
+          console.warn('[IBWithdrawal.getSummary] Could not fetch from ib_commission table:', error.message);
         }
       }
 
-      const totalEarned = fixed + spread;
+      // If no commission found in ib_commission table, fallback to calculating from trade history
+      if (totalEarned === 0) {
+        // Fetch group assignments (approved groups for this IB)
+        const assignmentsRes = await query(
+          `SELECT group_id, usd_per_lot, spread_share_percentage
+           FROM ib_group_assignments WHERE ib_request_id = $1`,
+          [ibRequestId]
+        );
 
+        // Helpers to normalize group IDs
+        const normalizeGroupId = (groupId) => {
+          if (!groupId) return '';
+          const s = String(groupId).toLowerCase().trim();
+          const parts = s.split(/[\\/]/);
+          return parts[parts.length - 1] || s;
+        };
+
+        // Build commission groups map
+        const commissionGroupsMap = new Map();
+        for (const r of assignmentsRes.rows) {
+          const k = normalizeGroupId(r.group_id);
+          if (k) {
+            commissionGroupsMap.set(k, {
+              spreadPct: Number(r.spread_share_percentage || 0),
+              usdPerLot: Number(r.usd_per_lot || 0)
+            });
+          }
+        }
+
+        // Get IB's own user_id to exclude
+        const ibUserIdForExclusion = ibUserId;
+        // Get referred user_ids to include
+        const referredUserIds = [];
+        try {
+          const refRes = await query(
+            'SELECT user_id FROM ib_referrals WHERE ib_request_id = $1 AND user_id IS NOT NULL',
+            [ibRequestId]
+          );
+          refRes.rows.forEach(row => {
+            if (row.user_id) referredUserIds.push(String(row.user_id));
+          });
+
+          const ibRefRes = await query(
+            `SELECT u.id as user_id 
+             FROM ib_requests ir
+             JOIN "User" u ON u.email = ir.email
+             WHERE ir.referred_by = $1 AND u.id IS NOT NULL`,
+            [ibRequestId]
+          );
+          ibRefRes.rows.forEach(row => {
+            if (row.user_id) referredUserIds.push(String(row.user_id));
+          });
+        } catch (error) {
+          console.warn('[IBWithdrawal.getSummary] Error getting referred user IDs:', error.message);
+        }
+
+        if (referredUserIds.length > 0 && commissionGroupsMap.size > 0) {
+          // Build WHERE clause to exclude IB's own trades and only include referred users' trades
+          let userFilter = '';
+          const params = [ibRequestId];
+          if (ibUserIdForExclusion) {
+            params.push(ibUserIdForExclusion);
+            userFilter = `AND user_id != $${params.length}`;
+          }
+          params.push(referredUserIds);
+          const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+
+          // Fetch trades - only from referred users, excluding IB's own trades (only closed trades with profit != 0)
+          const tradesRes = await query(
+            `SELECT group_id, volume_lots
+             FROM ib_trade_history
+             WHERE ib_request_id = $1 
+               AND close_price IS NOT NULL 
+               AND close_price != 0 
+               AND profit != 0
+               ${userFilter}
+               ${userInClause}`,
+            params
+          );
+
+          // Calculate commission using same logic as admin
+          for (const trade of tradesRes.rows) {
+            const lots = Number(trade.volume_lots || 0);
+            if (lots <= 0) continue;
+
+            const normalized = normalizeGroupId(trade.group_id);
+            let rule = commissionGroupsMap.get(normalized);
+            
+            // Try partial match if exact match fails
+            if (!rule) {
+              for (const [approvedKey, approvedRule] of commissionGroupsMap.entries()) {
+                if (normalized.includes(approvedKey) || approvedKey.includes(normalized)) {
+                  rule = approvedRule;
+                  break;
+                }
+              }
+            }
+
+            // Fallback to first available rule
+            if (!rule && commissionGroupsMap.size > 0) {
+              rule = Array.from(commissionGroupsMap.values())[0];
+            }
+
+            if (rule) {
+              const usdPerLot = Number(rule.usdPerLot || 0);
+              const spreadPct = Number(rule.spreadPct || 0);
+              
+              fixedEarned += lots * usdPerLot;
+              spreadEarned += lots * (spreadPct / 100);
+            }
+          }
+
+          totalEarned = fixedEarned + spreadEarned;
+        }
+      }
+
+      // Get approved/paid withdrawals
       const totalPaidRes = await query(
         `SELECT COALESCE(SUM(amount),0) AS total_paid
-         FROM ib_withdrawal_requests WHERE ib_request_id = $1 AND LOWER(status) IN ('paid','completed')`,
+         FROM ib_withdrawal_requests 
+         WHERE ib_request_id = $1 
+           AND LOWER(status) IN ('paid','completed','approved')`,
         [ibRequestId]
       );
       const pendingRes = await query(
         `SELECT COALESCE(SUM(amount),0) AS pending
-         FROM ib_withdrawal_requests WHERE ib_request_id = $1 AND LOWER(status) = 'pending'`,
+         FROM ib_withdrawal_requests 
+         WHERE ib_request_id = $1 
+           AND LOWER(status) = 'pending'`,
         [ibRequestId]
       );
 
       const totalPaid = Number(totalPaidRes.rows[0]?.total_paid || 0);
       const pending = Number(pendingRes.rows[0]?.pending || 0);
-      const available = Math.max(totalEarned - totalPaid - pending, 0);
+      
+      // Available Balance = Total Commission - Approved/Paid Withdrawals
+      const available = Math.max(totalEarned - totalPaid, 0);
 
-      return { totalEarned, totalPaid, pending, available, fixedEarned: fixed, spreadEarned: spread };
+      return { 
+        totalEarned, 
+        totalPaid, 
+        pending, 
+        available, 
+        fixedEarned, 
+        spreadEarned 
+      };
     } catch (e) {
-      // Fallback to original logic if the above fails
-      const totalEarnedRes = await query(
-        `SELECT COALESCE(SUM(ib_commission),0) AS total_earned
-         FROM ib_trade_history WHERE ib_request_id = $1`,
-        [ibRequestId]
-      );
+      console.error('[IBWithdrawal.getSummary] Error:', e);
+      // Fallback to simple calculation
       const totalPaidRes = await query(
         `SELECT COALESCE(SUM(amount),0) AS total_paid
-         FROM ib_withdrawal_requests WHERE ib_request_id = $1 AND LOWER(status) IN ('paid','completed')`,
+         FROM ib_withdrawal_requests 
+         WHERE ib_request_id = $1 
+           AND LOWER(status) IN ('paid','completed','approved')`,
         [ibRequestId]
       );
       const pendingRes = await query(
         `SELECT COALESCE(SUM(amount),0) AS pending
-         FROM ib_withdrawal_requests WHERE ib_request_id = $1 AND LOWER(status) = 'pending'`,
+         FROM ib_withdrawal_requests 
+         WHERE ib_request_id = $1 
+           AND LOWER(status) = 'pending'`,
         [ibRequestId]
       );
-      const totalEarned = Number(totalEarnedRes.rows[0]?.total_earned || 0);
       const totalPaid = Number(totalPaidRes.rows[0]?.total_paid || 0);
       const pending = Number(pendingRes.rows[0]?.pending || 0);
-      const available = Math.max(totalEarned - totalPaid - pending, 0);
-      return { totalEarned, totalPaid, pending, available, fixedEarned: totalEarned, spreadEarned: 0 };
+      const totalEarned = 0;
+      const available = Math.max(totalEarned - totalPaid, 0);
+      return { 
+        totalEarned, 
+        totalPaid, 
+        pending, 
+        available, 
+        fixedEarned: 0, 
+        spreadEarned: 0 
+      };
     }
   }
 
