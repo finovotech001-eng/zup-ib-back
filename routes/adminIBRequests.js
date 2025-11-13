@@ -1174,6 +1174,26 @@ router.get('/profiles/:id/referred-users', authenticateAdminToken, async (req, r
       [id]
     );
 
+    // Get commission groups for this IB
+    const groupsResult = await query(
+      `SELECT group_id, usd_per_lot, spread_share_percentage
+       FROM ib_group_assignments
+       WHERE ib_request_id = $1`,
+      [id]
+    );
+
+    // Build commission groups map
+    const commissionGroupsMap = new Map();
+    for (const r of groupsResult.rows) {
+      const k = normalizeGroupId(r.group_id);
+      if (k) {
+        commissionGroupsMap.set(k, {
+          spreadPct: Number(r.spread_share_percentage || 0),
+          usdPerLot: Number(r.usd_per_lot || 0)
+        });
+      }
+    }
+
     // Combine and deduplicate by user_id
     const userMap = new Map();
     
@@ -2013,7 +2033,7 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       message: 'Commission synced and saved successfully',
       data: {
@@ -2025,7 +2045,7 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
   } catch (error) {
     console.error('Error syncing commission:', error);
     console.error('Error stack:', error.stack);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: 'Unable to sync commission',
       error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined,
