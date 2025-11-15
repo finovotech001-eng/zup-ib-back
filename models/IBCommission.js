@@ -21,6 +21,8 @@ export class IBCommission {
             ib_request_id INTEGER NOT NULL,
             user_id TEXT NOT NULL,
             total_commission NUMERIC(15, 2) DEFAULT 0,
+            fixed_commission NUMERIC(15, 2) DEFAULT 0,
+            spread_commission NUMERIC(15, 2) DEFAULT 0,
             total_trades INTEGER DEFAULT 0,
             total_lots NUMERIC(15, 2) DEFAULT 0,
             last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -73,43 +75,27 @@ export class IBCommission {
       // Ensure table exists first
       await this.createTable();
       
-      // Check if table has new columns, if not, alter it
+      // Ensure all columns exist (add if missing)
       try {
-        const checkColumns = await query(`
-          SELECT column_name 
-          FROM information_schema.columns 
-          WHERE table_name = 'ib_commission' 
-          AND column_name IN ('total_trades', 'total_lots', 'fixed_commission', 'spread_commission')
-        `);
-        const columnNames = checkColumns.rows.map(r => r.column_name);
-        
-        // If old columns exist, remove them and add new ones
-        if (columnNames.includes('fixed_commission') || columnNames.includes('spread_commission')) {
-          console.log('[IBCommission] Table has old columns, attempting to alter...');
-          try {
-            await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS total_trades INTEGER DEFAULT 0;');
-            await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS total_lots NUMERIC(15, 2) DEFAULT 0;');
-            await query('ALTER TABLE ib_commission DROP COLUMN IF EXISTS fixed_commission;');
-            await query('ALTER TABLE ib_commission DROP COLUMN IF EXISTS spread_commission;');
-            console.log('[IBCommission] Table structure updated successfully');
-          } catch (alterError) {
-            console.warn('[IBCommission] Could not alter table structure:', alterError.message);
-            // Continue anyway, will try the insert
-          }
-        }
-      } catch (checkError) {
-        console.warn('[IBCommission] Could not check table structure:', checkError.message);
-        // Continue anyway
+        await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS fixed_commission NUMERIC(15, 2) DEFAULT 0;');
+        await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS spread_commission NUMERIC(15, 2) DEFAULT 0;');
+        await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS total_trades INTEGER DEFAULT 0;');
+        await query('ALTER TABLE ib_commission ADD COLUMN IF NOT EXISTS total_lots NUMERIC(15, 2) DEFAULT 0;');
+      } catch (alterError) {
+        console.warn('[IBCommission] Could not alter table structure:', alterError.message);
+        // Continue anyway, will try the insert
       }
       
-      const { totalCommission, totalTrades, totalLots } = commissionData;
+      const { totalCommission, fixedCommission, spreadCommission, totalTrades, totalLots } = commissionData;
       
       const upsertQuery = `
-        INSERT INTO ib_commission (ib_request_id, user_id, total_commission, total_trades, total_lots, last_updated, updated_at)
-        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        INSERT INTO ib_commission (ib_request_id, user_id, total_commission, fixed_commission, spread_commission, total_trades, total_lots, last_updated, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT (ib_request_id, user_id)
         DO UPDATE SET
           total_commission = EXCLUDED.total_commission,
+          fixed_commission = EXCLUDED.fixed_commission,
+          spread_commission = EXCLUDED.spread_commission,
           total_trades = EXCLUDED.total_trades,
           total_lots = EXCLUDED.total_lots,
           last_updated = CURRENT_TIMESTAMP,
@@ -117,12 +103,14 @@ export class IBCommission {
         RETURNING *;
       `;
       
-      console.log(`[IBCommission] Upserting: ib_request_id=${ibRequestId}, user_id=${userId}, total_commission=${totalCommission}, total_trades=${totalTrades}, total_lots=${totalLots}`);
+      console.log(`[IBCommission] Upserting: ib_request_id=${ibRequestId}, user_id=${userId}, total_commission=${totalCommission}, fixed_commission=${fixedCommission || 0}, spread_commission=${spreadCommission || 0}, total_trades=${totalTrades || 0}, total_lots=${totalLots || 0}`);
       
       const result = await query(upsertQuery, [
         ibRequestId,
         userId,
         Number(totalCommission || 0),
+        Number(fixedCommission || 0),
+        Number(spreadCommission || 0),
         Number(totalTrades || 0),
         Number(totalLots || 0)
       ]);

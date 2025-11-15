@@ -1101,6 +1101,28 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
     try { tradingAccounts = await getTradingAccounts(record.id); } catch (e) { console.warn('getTradingAccounts error:', e.message); tradingAccounts = []; }
     try { tradeHistory = await getTradeHistory(record.id); } catch (e) { console.warn('getTradeHistory error:', e.message); tradeHistory = []; }
     try { treeStructure = await getTreeStructure(record.id); } catch (e) { console.warn('getTreeStructure error:', e.message); treeStructure = { ownLots: 0, teamLots: 0, totalTrades: 0, root: null }; }
+    
+    // Get commission data from ib_commission table
+    let commissionData = null;
+    try {
+      const ibUserResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [record.email]);
+      const ibUserId = ibUserResult.rows[0]?.id ? String(ibUserResult.rows[0].id) : null;
+      if (ibUserId) {
+        commissionData = await IBCommission.getByIBAndUser(record.id, ibUserId);
+        if (commissionData) {
+          commissionData = {
+            totalCommission: Number(commissionData.total_commission || 0),
+            fixedCommission: Number(commissionData.fixed_commission || 0),
+            spreadCommission: Number(commissionData.spread_commission || 0),
+            totalTrades: Number(commissionData.total_trades || 0),
+            totalLots: Number(commissionData.total_lots || 0),
+            lastUpdated: commissionData.last_updated
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('getCommissionData error:', e.message);
+    }
 
     const profile = {
       id: record.id,
@@ -1120,6 +1142,7 @@ router.get('/profiles/:id', authenticateAdminToken, async (req, res) => {
       tradingAccounts,
       tradeHistory,
       treeStructure,
+      commissionData, // Add commission data from ib_commission table
       levelUpHistory: levelUpHistory.map(h => ({
         id: h.id,
         fromStructure: h.from_structure_name,
@@ -1959,8 +1982,11 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
 
     // Calculate commission, trades, and lots from referred users' trades only (excluding IB's own trades)
     let balance = 0;
+    let fixedCommission = 0;
+    let spreadCommission = 0;
     let totalTrades = 0;
     let totalLots = 0;
+    let commissionResult = null;
 
     if (referredUserIds.length > 0 && commissionGroupsMap.size > 0) {
       // Build WHERE clause to exclude IB's own trades and only include referred users' trades
@@ -1987,13 +2013,15 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
       console.log(`[Sync Commission] Found ${tradesRes.rows.length} trades from referred users`);
 
       // Calculate commission using helper function
-      const commissionResult = calculateCommissionFromTrades(tradesRes.rows, commissionGroupsMap);
+      commissionResult = calculateCommissionFromTrades(tradesRes.rows, commissionGroupsMap);
       
       balance = commissionResult.total;
+      fixedCommission = commissionResult.fixed;
+      spreadCommission = commissionResult.spread;
       totalTrades = commissionResult.totalTrades;
       totalLots = commissionResult.totalLots;
 
-      console.log(`[Sync Commission] Calculation result: fixed=${commissionResult.fixed}, spread=${commissionResult.spread}, total=${balance}, trades=${totalTrades}, lots=${totalLots}`);
+      console.log(`[Sync Commission] Calculation result: fixed=${fixedCommission}, spread=${spreadCommission}, total=${balance}, trades=${totalTrades}, lots=${totalLots}`);
     } else {
       if (referredUserIds.length === 0) {
         console.log(`[Sync Commission] WARNING: No referred users found for IB ${id}`);
@@ -2002,15 +2030,17 @@ router.post('/profiles/:id/sync-commission', authenticateAdminToken, async (req,
         console.log(`[Sync Commission] WARNING: No commission groups found for IB ${id}`);
       }
     }
-
-    console.log(`[Sync Commission] Final calculation: total_commission=${balance}, total_trades=${totalTrades}, total_lots=${totalLots}`);
+    
+    console.log(`[Sync Commission] Final calculation: total_commission=${balance}, fixed_commission=${fixedCommission}, spread_commission=${spreadCommission}, total_trades=${totalTrades}, total_lots=${totalLots}`);
 
     // Save/update commission in ib_commission table
     if (ibUserId) {
       try {
-        console.log(`[Sync Commission] Saving to database: ib_request_id=${id}, user_id=${ibUserId}, total_commission=${balance}, total_trades=${totalTrades}, total_lots=${totalLots}`);
+        console.log(`[Sync Commission] Saving to database: ib_request_id=${id}, user_id=${ibUserId}, total_commission=${balance}, fixed_commission=${fixedCommission}, spread_commission=${spreadCommission}, total_trades=${totalTrades}, total_lots=${totalLots}`);
         await IBCommission.upsertCommission(id, ibUserId, {
           totalCommission: balance,
+          fixedCommission: fixedCommission,
+          spreadCommission: spreadCommission,
           totalTrades: totalTrades,
           totalLots: totalLots
         });

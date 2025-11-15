@@ -25,6 +25,10 @@ router.get('/', authenticateToken, async (req, res) => {
         data: {
           balance: 0,
           totalProfit: 0,
+          totalEarning: 0,
+          totalEarnings: 0,
+          fixedCommission: 0,
+          spreadCommission: 0,
           commissionStructures: [],
           referralCode: null,
           referralLink: null
@@ -88,42 +92,19 @@ router.get('/', authenticateToken, async (req, res) => {
     const ibUserResult = await query('SELECT id FROM "User" WHERE LOWER(email) = LOWER($1)', [ib.email]);
     const ibUserId = ibUserResult.rows[0]?.id ? String(ibUserResult.rows[0].id) : null;
 
-    // Try to get cached commission from ib_commission table first (for faster response)
+    // Always calculate commission from trade history to ensure fresh data
+    // Then update the database with the calculated values
     let balance = 0;
     let fixedCommission = 0;
     let spreadCommission = 0;
-    let useCachedData = false;
+    
+    // Get IB's own user_id to exclude
+    const ibUserIdForExclusion = await getIBUserId(ib.id);
+    // Get referred user_ids to include
+    const referredUserIds = await getReferredUserIds(ib.id);
 
-    if (ibUserId) {
-      try {
-        const cachedCommission = await IBCommission.getByIBAndUser(ib.id, ibUserId);
-        if (cachedCommission) {
-          const lastUpdated = new Date(cachedCommission.last_updated);
-          const now = new Date();
-          const hoursDiff = (now - lastUpdated) / (1000 * 60 * 60);
-          
-          // Use cached data if it's less than 4 hours old
-          if (hoursDiff < 4) {
-            balance = Number(cachedCommission.total_commission || 0);
-            fixedCommission = Number(cachedCommission.fixed_commission || 0);
-            spreadCommission = Number(cachedCommission.spread_commission || 0);
-            useCachedData = true;
-          }
-        }
-      } catch (error) {
-        // Table might not exist yet, will calculate below
-        console.warn('Could not fetch from ib_commission table, will calculate:', error.message);
-      }
-    }
-
-    // If no cached data or cache is old, calculate commission from trades
-    if (!useCachedData) {
-      // Get IB's own user_id to exclude
-      const ibUserIdForExclusion = await getIBUserId(ib.id);
-      // Get referred user_ids to include
-      const referredUserIds = await getReferredUserIds(ib.id);
-
-      if (referredUserIds.length > 0) {
+    // Always calculate from trades (don't use cache) to ensure accuracy
+    if (referredUserIds.length > 0) {
         // Build WHERE clause to exclude IB's own trades and only include referred users' trades
         let userFilter = '';
         const params = [ib.id];
@@ -188,20 +169,53 @@ router.get('/', authenticateToken, async (req, res) => {
         }
       }
 
-      balance = fixedCommission + spreadCommission;
+    balance = fixedCommission + spreadCommission;
 
-      // Save/update commission in ib_commission table for reliable dashboard display
-      if (ibUserId) {
-        try {
-          await IBCommission.upsertCommission(ib.id, ibUserId, {
-            totalCommission: balance,
-            fixedCommission: fixedCommission,
-            spreadCommission: spreadCommission
-          });
-        } catch (error) {
-          console.error('Error saving commission to ib_commission table:', error);
-          // Don't fail the request if table doesn't exist yet
+    // Always save/update commission in ib_commission table with fresh calculated values
+    if (ibUserId) {
+      try {
+        // Calculate total trades and lots for complete data
+        let totalTrades = 0;
+        let totalLots = 0;
+        if (referredUserIds.length > 0) {
+          let userFilter = '';
+          const params = [ib.id];
+          if (ibUserIdForExclusion) {
+            params.push(ibUserIdForExclusion);
+            userFilter = `AND user_id != $${params.length}`;
+          }
+          params.push(referredUserIds);
+          const userInClause = `AND user_id = ANY($${params.length}::text[])`;
+          
+          const statsRes = await query(
+            `SELECT COUNT(*)::int AS total_trades, COALESCE(SUM(volume_lots), 0) AS total_lots
+             FROM ib_trade_history
+             WHERE ib_request_id = $1 
+               AND close_price IS NOT NULL 
+               AND close_price != 0 
+               AND profit != 0
+               ${userFilter}
+               ${userInClause}`,
+            params
+          );
+          
+          if (statsRes.rows.length > 0) {
+            totalTrades = Number(statsRes.rows[0].total_trades || 0);
+            totalLots = Number(statsRes.rows[0].total_lots || 0);
+          }
         }
+        
+        await IBCommission.upsertCommission(ib.id, ibUserId, {
+          totalCommission: balance,
+          fixedCommission: fixedCommission,
+          spreadCommission: spreadCommission,
+          totalTrades: totalTrades,
+          totalLots: totalLots
+        });
+        console.log(`[Dashboard] Updated ib_commission table: total=${balance}, fixed=${fixedCommission}, spread=${spreadCommission}`);
+      } catch (error) {
+        console.error('Error saving commission to ib_commission table:', error);
+        // Don't fail the request if table doesn't exist yet
       }
     }
     
@@ -224,6 +238,8 @@ router.get('/', authenticateToken, async (req, res) => {
       data: {
         balance,
         totalProfit: balance,
+        totalEarning: balance, // Add totalEarning field for clarity
+        totalEarnings: balance, // Alternative field name
         fixedCommission,
         spreadCommission,
         ibType: ib.ib_type,
@@ -235,9 +251,11 @@ router.get('/', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching dashboard data:', error);
+    console.error('Error stack:', error.stack);
     res.status(500).json({
       success: false,
-      message: 'Unable to fetch dashboard data'
+      message: 'Unable to fetch dashboard data',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -418,6 +436,9 @@ router.post('/sync', authenticateToken, async (req, res) => {
       message: 'Commission synced successfully',
       data: {
         balance,
+        totalProfit: balance,
+        totalEarning: balance,
+        totalEarnings: balance,
         fixedCommission,
         spreadCommission
       }
@@ -430,8 +451,6 @@ router.post('/sync', authenticateToken, async (req, res) => {
     });
   }
 });
-
-export default router;
 
 // Quick reports: day-wise IB commission and registrations with range filters
 router.get('/quick-reports', authenticateToken, async (req, res) => {
@@ -512,3 +531,5 @@ router.get('/quick-reports', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, message: 'Unable to fetch quick reports' });
   }
 });
+
+export default router;

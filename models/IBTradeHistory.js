@@ -94,41 +94,82 @@ export class IBTradeHistory {
 
     let usdPerLot = resolveUsdPerLot(groupId);
     console.log(`[UPSERT] Processing ${trades.length} trades for account ${accountId}, usdPerLot=${usdPerLot}, groupId=${groupId}`);
+    console.log(`[UPSERT] Sample trade structure:`, trades.length > 0 ? JSON.stringify(trades[0], null, 2) : 'No trades');
 
     for (const trade of trades) {
       try {
-        const orderId = String(trade?.OrderId ?? '');
-        if (!orderId) { skipped.noOrderId++; continue; }
+        // Handle both DealId and OrderId from trades-closed API
+        const orderId = String(trade?.OrderId || trade?.DealId || '');
+        if (!orderId || orderId === 'undefined' || orderId === 'null') { 
+          skipped.noOrderId++; 
+          continue; 
+        }
         
         const symbol = String(trade?.Symbol || '').trim();
         if (!symbol) { skipped.noSymbol++; continue; }
         
-        const orderType = String(trade?.OrderType || '').toLowerCase().trim();
-        if (orderType !== 'buy' && orderType !== 'sell') { skipped.notBuySell++; continue; }
+        // For trades-closed API, OrderType might not be present, but we can infer from Profit
+        // If OrderType is missing, we'll still save the trade (trades-closed are already closed)
+        let orderType = String(trade?.OrderType || '').toLowerCase().trim();
+        if (!orderType || (orderType !== 'buy' && orderType !== 'sell')) {
+          // Infer order type from profit: positive profit usually means buy, negative means sell
+          // But this is not always accurate, so default to 'buy' if we can't determine
+          const profit = Number(trade?.Profit || 0);
+          orderType = profit >= 0 ? 'buy' : 'sell';
+        }
         
-        const entry = String(trade?.Entry || trade?.EntryType || trade?.DealEntry || '').toLowerCase();
+        // For trades-closed API, all trades are already closed trades
+        // So we accept all trades that have VolumeLots and Profit
         const hasCloseTime = Boolean(
           trade?.CloseTime || trade?.ClosedTime || trade?.CloseDate || trade?.Closed ||
           trade?.TimeClose || trade?.DoneTime || trade?.DealTime || trade?.CloseTimeMsc || 
           trade?.CloseTimeMS || trade?.CloseTimeMs || trade?.ClosedAt || trade?.Time
         );
-        const closePrice = Number(trade?.ClosePrice || 0);
+        const closePrice = Number(trade?.ClosePrice || trade?.Price || 0);
         const openPrice = Number(trade?.OpenPrice || 0);
-        
-        const isClosedByEntry = entry.includes('out') || entry.includes('close');
-        const isClosedByFields = (closePrice > 0 || hasCloseTime) && openPrice > 0;
-        const isClosed = isClosedByEntry || isClosedByFields;
-        
-        if (!isClosed) { skipped.notClosed++; continue; }
-        
-        const volume = Number(trade?.Volume || 0);
-        if (!volume || volume === 0) { skipped.noVolume++; continue; }
-        
         const profit = Number(trade?.Profit || 0);
+        
+        // For trades-closed API, we accept all trades (they're all closed by definition)
+        // But skip if profit is zero and no close time (might be invalid)
+        const isClosed = hasCloseTime || closePrice > 0 || profit !== 0;
+        
+        if (!isClosed) { 
+          skipped.notClosed++; 
+          console.log(`[UPSERT] Skipping trade ${orderId}: not closed (no CloseTime, no closePrice, profit=0)`);
+          continue; 
+        }
+        
+        // Handle VolumeLots from trades-closed API (divide by 100) or Volume from old API
+        let volumeLots = 0;
+        if (trade?.VolumeLots !== undefined && trade?.VolumeLots !== null) {
+          // trades-closed API provides VolumeLots - divide by 100
+          volumeLots = Number(trade.VolumeLots || 0) / 100;
+        } else {
+          // Fallback to Volume field for backward compatibility
+          const volume = Number(trade?.Volume || 0);
+          volumeLots = volume < 0.1 ? volume * 1000 : volume;
+        }
+        
+        if (!volumeLots || volumeLots === 0) { skipped.noVolume++; continue; }
+        
         const id = `${accountId}-${orderId}`;
-        const volumeLots = volume < 0.1 ? volume * 1000 : volume;
         const ibCommission = volumeLots * usdPerLot;
         const finalClosePrice = closePrice > 0 ? closePrice : openPrice;
+        
+        // Parse close time if available
+        let closeTimeValue = null;
+        if (trade?.CloseTime) {
+          try {
+            if (typeof trade.CloseTime === 'string') {
+              closeTimeValue = new Date(trade.CloseTime).toISOString();
+            } else if (typeof trade.CloseTime === 'number') {
+              const ms = trade.CloseTime > 1e12 ? trade.CloseTime : trade.CloseTime * 1000;
+              closeTimeValue = new Date(ms).toISOString();
+            }
+          } catch (e) {
+            console.warn(`[UPSERT] Failed to parse CloseTime for trade ${orderId}:`, e.message);
+          }
+        }
 
         const queryText = `
           INSERT INTO ib_trade_history (
@@ -169,13 +210,17 @@ export class IBTradeHistory {
         ]);
 
         saved.push(result.rows[0]);
+        console.log(`[UPSERT] ✓ Saved trade: orderId=${orderId}, symbol=${symbol}, volumeLots=${volumeLots}, profit=${profit}`);
       } catch (error) {
-        console.error(`[UPSERT] Error on trade ${trade?.OrderId}:`, error.message);
+        const tradeId = trade?.OrderId || trade?.DealId || 'unknown';
+        console.error(`[UPSERT] ✗ Error on trade ${tradeId}:`, error.message);
+        console.error(`[UPSERT] Trade data:`, JSON.stringify(trade, null, 2));
         skipped.errors++;
       }
     }
 
-    console.log(`[UPSERT] Saved ${saved.length}/${trades.length}. Skipped: notClosed=${skipped.notClosed}, notBuySell=${skipped.notBuySell}, noVolume=${skipped.noVolume}, errors=${skipped.errors}`);
+    console.log(`[UPSERT] Summary: Saved ${saved.length}/${trades.length} trades`);
+    console.log(`[UPSERT] Skipped breakdown: noOrderId=${skipped.noOrderId}, noSymbol=${skipped.noSymbol}, notBuySell=${skipped.notBuySell}, notClosed=${skipped.notClosed}, noVolume=${skipped.noVolume}, errors=${skipped.errors}`);
     return saved;
   }
 
