@@ -1014,7 +1014,7 @@ router.get('/profiles/approved', authenticateAdminToken, async (req, res) => {
           spread_percentage_per_lot,
           admin_comments
         FROM ib_requests
-        WHERE LOWER(TRIM(status)) = 'approved'
+        WHERE status = 'approved'
         ORDER BY approved_at DESC NULLS LAST, submitted_at DESC
       `
     );
@@ -1039,7 +1039,12 @@ router.get('/profiles/approved', authenticateAdminToken, async (req, res) => {
     res.json({ success: true, data: { profiles } });
   } catch (error) {
     console.error('Fetch approved IB profiles error:', error);
-    res.status(500).json({ success: false, message: 'Unable to fetch approved IB profiles', error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined });
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Unable to fetch approved IB profiles', 
+      error: process.env.NODE_ENV !== 'production' ? String(error?.message || error) : undefined 
+    });
   }
 });
 

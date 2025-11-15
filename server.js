@@ -43,6 +43,8 @@ import userSymbolsRoutes from './routes/userSymbols.js';
 import userProfileRoutes from './routes/userProfile.js';
 import userPaymentsRoutes from './routes/userPayments.js';
 import userDashboardRoutes from './routes/userDashboard.js';
+import userRewardsRoutes from './routes/userRewards.js';
+import adminRewardsRoutes from './routes/adminRewards.js';
 
 
 dotenv.config();
@@ -161,12 +163,14 @@ app.use('/api/admin', adminReferralsRoutes);
 // Public, unauthenticated referral endpoints (used by CRM)
 app.use('/api/public/referrals', publicReferralsRoutes);
 app.use('/api/admin/dashboard', adminDashboardRoutes);
+app.use('/api/admin/rewards', adminRewardsRoutes);
 // Mount user-facing routes
 app.use('/api/user/clients', userClientsRoutes);
 app.use('/api/user/symbols', userSymbolsRoutes);
 app.use('/api/user', userProfileRoutes);
 app.use('/api/user', userPaymentsRoutes);
 app.use('/api/user/dashboard', userDashboardRoutes);
+app.use('/api/user/rewards', userRewardsRoutes);
 
 
 // Health check endpoint
